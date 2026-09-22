@@ -27,7 +27,10 @@ FIELD_BAR_CODE = "BAR_CODE"
 LIST_NUM_OF_ROWS = 500
 HIRA_CALL_LIMIT = 600
 MFDS_CALL_LIMIT = 1000
-LIST_CSV_FIELDS = ["ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", "CANCEL_NAME", "ITEM_PERMIT_DATE"]  # 바코드는 상세 API에서만 확인 가능
+LIST_CSV_FIELDS = [
+    "ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", "CANCEL_NAME", "ITEM_PERMIT_DATE",
+    "MAIN_ITEM_INGR", "MAIN_INGR_ENG",
+]  # 바코드는 상세 API에서만 확인 가능
 BASE_COLUMNS = ["허가제품명", "제약사한글명", "약가", "약효분류", "주성분영문명", "성분명", "효능효과", "용법용량"]
 HIRA_MEFT_FIELD = "meftDivNo"
 
@@ -130,6 +133,20 @@ def parse_strength(text):
     return ""
 
 
+def product_family_name(product_name):
+    """함량만 다른 동일 상품을 묶기 위해 제품명에서 대표 함량 표기를 제거합니다."""
+    value = clean_whitespace(product_name)
+    strength_patterns = [
+        r"(?i)\d+(?:\.\d+)?\s*(?:마이크로그램|μg|mcg|밀리그램|mg|그램|g)(?:\s*/\s*\d*(?:\.\d+)?\s*(?:mL|ml|밀리리터|정|캡슐|포|바이알))?",
+        r"(?i)\d+(?:\.\d+)?\s*(?:%|IU|U)(?:\s*/\s*\d*(?:\.\d+)?\s*(?:mL|ml|밀리리터))?",
+    ]
+    for pattern in strength_patterns:
+        value = re.sub(pattern, " ", value)
+    value = re.sub(r"[\s_\-]+", " ", value)
+    value = re.sub(r"\(\s*\)|\[\s*\]", "", value)
+    return clean_whitespace(value).strip("-_()[] ") or clean_whitespace(product_name)
+
+
 def group_label(group_id):
     if group_id == "applicant":
         return "신청의약품"
@@ -210,6 +227,31 @@ def build_group_items(by_seq):
                 "strength": st.session_state.strength_overrides.get(seq, parsed),
             })
     return items
+
+
+def apply_all_fields_preset():
+    selected = bool(st.session_state.get("preset_all_fields", False))
+    for key in EXTRA_FIELD_ORDER:
+        st.session_state[f"extra_{key}"] = selected
+    st.session_state.preset_new_drug_intro = selected
+
+
+def apply_new_drug_preset():
+    selected = bool(st.session_state.get("preset_new_drug_intro", False))
+    for key in NEW_DRUG_PRESET_KEYS:
+        st.session_state[f"extra_{key}"] = selected
+    st.session_state.preset_all_fields = all(
+        st.session_state.get(f"extra_{key}", False) for key in EXTRA_FIELD_ORDER
+    )
+
+
+def sync_field_presets():
+    st.session_state.preset_new_drug_intro = all(
+        st.session_state.get(f"extra_{key}", False) for key in NEW_DRUG_PRESET_KEYS
+    )
+    st.session_state.preset_all_fields = all(
+        st.session_state.get(f"extra_{key}", False) for key in EXTRA_FIELD_ORDER
+    )
 
 
 def clean_ingredient(text):
@@ -658,17 +700,18 @@ def get_effect_classification(item_name, bar_code, service_key, call_counter, ca
     return value
 
 
-def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors):
+def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors, include_all_fields=False):
     cached = cache_detail.get(item_seq, {})
     have_base = "성분명" in cached
     missing_extras = [key for key in wanted_extras if key not in cached or not clean_whitespace(cached.get(key, ""))]
-    if have_base and not missing_extras:
+    have_all_fields = "_all_api_fields" in cached
+    if have_base and not missing_extras and (not include_all_fields or have_all_fields):
         return cached
     cached_direct_ready = all(
         key not in EXTRA_DIRECT_FIELDS or ("_raw_" + key) in cached
         for key in missing_extras
     )
-    if have_base and "_raw_nb_xml" in cached and cached_direct_ready:
+    if have_base and "_raw_nb_xml" in cached and cached_direct_ready and (not include_all_fields or have_all_fields):
         for key in missing_extras:
             if key in EXTRA_DIRECT_FIELDS:
                 cached[key] = cached.get("_raw_" + key, "")
@@ -697,6 +740,11 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     cached["_bar_code"] = item.get("BAR_CODE", "")
     cached["_edi_code"] = item.get("EDI_CODE", "")
     cached["_raw_nb_xml"] = nb_xml
+    cached["_all_api_fields"] = {
+        str(key): clean_whitespace(value)
+        for key, value in item.items()
+        if not isinstance(value, (dict, list))
+    }
     for key, field in EXTRA_DIRECT_FIELDS.items():
         cached["_raw_" + key] = clean_whitespace(item.get(field, ""))
     for key in wanted_extras:
@@ -715,7 +763,11 @@ def list_cache_is_fresh():
     try:
         with LIST_META_FILE.open("r", encoding="utf-8") as file:
             meta = json.load(file)
-        return meta.get("collected_date_kst") == current_kst_date()
+        if meta.get("collected_date_kst") != current_kst_date():
+            return False
+        with LIST_FILE.open("r", encoding="utf-8-sig", newline="") as file:
+            cached_fields = set(next(csv.reader(file), []))
+        return set(LIST_CSV_FIELDS).issubset(cached_fields)
     except (OSError, json.JSONDecodeError):
         return False
 
@@ -747,6 +799,10 @@ def load_permitted_drugs(mfds_key, data_dir_string, cache_day, force_refresh_tok
         try:
             with meta_file.open("r", encoding="utf-8") as file:
                 cache_is_fresh = json.load(file).get("collected_date_kst") == cache_day
+            if cache_is_fresh:
+                with list_file.open("r", encoding="utf-8-sig", newline="") as file:
+                    cached_fields = set(next(csv.reader(file), []))
+                cache_is_fresh = set(LIST_CSV_FIELDS).issubset(cached_fields)
         except (OSError, json.JSONDecodeError):
             cache_is_fresh = False
 
@@ -959,7 +1015,7 @@ def render_resizable_wrapped_table(display_df, show_index=False, height=720, tab
 
 
 def make_comparison_df(result_df):
-    """행에는 조회 항목, 열에는 의약품을 배치한 비교표를 생성합니다."""
+    """동일 상품의 여러 함량을 한 열에 모아 비교표를 생성합니다."""
     comparison = result_df.copy()
     # 그룹 기능 사용 시 비교의약품을 먼저, 신청의약품을 맨 오른쪽에 배치합니다.
     if "구분" in comparison.columns:
@@ -967,24 +1023,45 @@ def make_comparison_df(result_df):
             lambda value: 1 if clean_whitespace(value) == "신청의약품" else 0
         )
         comparison = comparison.sort_values("_그룹정렬", kind="stable").drop(columns=["_그룹정렬"])
-    comparison_names = []
-    seen = {}
+
+    grouped = {}
     for _, row in comparison.iterrows():
-        prefix = " ".join(
-            value for value in [clean_whitespace(row.get("구분", "")), clean_whitespace(row.get("함량", ""))]
-            if value
-        )
         product_name = clean_whitespace(row.get("허가제품명", "품목"))
-        name = f"{prefix} | {product_name}" if prefix else product_name
-        seen[name] = seen.get(name, 0) + 1
-        comparison_names.append(name if seen[name] == 1 else f"{name} ({seen[name]})")
-    comparison["_비교용약품명"] = comparison_names
-    comparison = comparison.set_index("_비교용약품명").T
-    comparison.index.name = "조회 항목"
-    return comparison
+        family_name = product_family_name(product_name)
+        group_name = clean_whitespace(row.get("구분", ""))
+        manufacturer = clean_whitespace(row.get("제약사한글명", ""))
+        key = (group_name, family_name.casefold(), manufacturer.casefold())
+        grouped.setdefault(key, {"group": group_name, "family": family_name, "rows": []})["rows"].append(row)
+
+    columns = {}
+    seen_names = {}
+    for payload in grouped.values():
+        rows = payload["rows"]
+        header = " | ".join(value for value in [payload["group"], payload["family"]] if value)
+        seen_names[header] = seen_names.get(header, 0) + 1
+        column_name = header if seen_names[header] == 1 else f"{header} ({seen_names[header]})"
+        merged = {}
+        for field in comparison.columns:
+            values = []
+            for row in rows:
+                strength = clean_whitespace(row.get("함량", "")) or parse_strength(row.get("허가제품명", "")) or "함량 미상"
+                value = clean_whitespace(row.get(field, ""))
+                values.append((strength, value))
+            if len(values) == 1:
+                merged[field] = values[0][1]
+            elif field == "구분":
+                merged[field] = payload["group"]
+            elif field == "함량":
+                merged[field] = "\n".join(dict.fromkeys(strength for strength, _ in values))
+            else:
+                merged[field] = "\n".join(f"{strength}: {value}" for strength, value in values)
+        columns[column_name] = merged
+    result = pd.DataFrame(columns)
+    result.index.name = "조회 항목"
+    return result
 
 
-def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_lookup=None):
+def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_lookup=None, include_all_fields=False):
     cache_code = load_json_cache(CACHE_CODE_FILE)
     cache_name = load_json_cache(CACHE_NAME_FILE)
     cache_detail = load_json_cache(CACHE_DETAIL_FILE)
@@ -1002,7 +1079,10 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
         group_meta = (group_lookup or {}).get(str(item_seq), {})
         # 목록 API에는 바코드가 없으므로, 상세 API(fetch_detail)를 먼저 불러 실제 바코드를 얻습니다.
         fetch_keys = list(dict.fromkeys(ALWAYS_FETCH_DETAIL_KEYS + wanted_extras))
-        detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, fetch_keys, errors)
+        detail = fetch_detail(
+            item_seq, mfds_key, call_counter, cache_detail, fetch_keys, errors,
+            include_all_fields=include_all_fields,
+        )
         bar_code = detail.get("_bar_code", "")
         price, method, price_item = match_price(
             item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors, as_of_date
@@ -1011,6 +1091,9 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
         out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "약가": format_price(price), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": clean_whitespace((price_item or {}).get("mdsCd", "")), "약가적용시작일": clean_whitespace((price_item or {}).get("adtStaDd", "")), "판매예정종료일": clean_whitespace((price_item or {}).get("sellEptDd", "")), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
+        if include_all_fields:
+            for api_key, api_value in detail.get("_all_api_fields", {}).items():
+                out_row.setdefault(f"MFDS_{api_key}", api_value)
         output.append(out_row)
         reference_items.append({
             "group": {
@@ -1028,6 +1111,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
                 "indications_text": detail.get("효능효과", ""),
                 "dosage_text": detail.get("용법용량", ""),
                 "selected_extra_fields": {key: detail.get(key, "") for key in wanted_extras},
+                "all_api_fields": detail.get("_all_api_fields", {}) if include_all_fields else None,
             },
             "hira": {
                 "reference_date": as_of_date.isoformat(),
@@ -1453,6 +1537,7 @@ except Exception as exc:
 
 normal_rows = [row for row in all_rows if row.get("CANCEL_NAME") == "정상"]
 by_seq = {row.get("ITEM_SEQ", ""): row for row in normal_rows}
+search_detail_cache = load_json_cache(CACHE_DETAIL_FILE)
 st.success(f"정상 품목 {len(normal_rows):,}건 준비 완료")
 
 if "selection" not in st.session_state:
@@ -1486,7 +1571,10 @@ elif not group_mode and previous_group_mode:
     st.session_state.selection = list(dict.fromkeys(flatten_group_seqs()))
 st.session_state.group_mode_previous = group_mode
 
-query = st.text_input("의약품명 또는 제약사명", placeholder="예: 타이레놀, 한미약품")
+query = st.text_input(
+    "의약품명 · 제약사명 · 성분명 · 주성분 영문명",
+    placeholder="예: 타이레놀, 한미약품, 아세트아미노펜, acetaminophen",
+)
 target_group_id = None
 if group_mode:
     target_col, add_group_col = st.columns([3, 1])
@@ -1509,13 +1597,30 @@ if group_mode:
 matches = []
 if query.strip():
     q = query.strip().casefold()
-    matches = [row for row in normal_rows if q in row.get("ITEM_NAME", "").casefold() or q in row.get("ENTP_NAME", "").casefold()][:200]
+    matches = []
+    for row in normal_rows:
+        cached_detail = search_detail_cache.get(str(row.get("ITEM_SEQ", "")), {})
+        searchable_values = [
+            row.get("ITEM_NAME", ""), row.get("ENTP_NAME", ""),
+            row.get("MAIN_ITEM_INGR", ""), row.get("MAIN_INGR_ENG", ""),
+            cached_detail.get("성분명", ""), cached_detail.get("주성분영문명", ""),
+        ]
+        if any(q in str(value).casefold() for value in searchable_values):
+            matches.append(row)
+            if len(matches) >= 200:
+                break
     st.caption(f"검색결과 {len(matches)}건 표시 (최대 200건)")
 
 # 검색 결과를 드롭다운이 아닌 전체 행이 보이는 선택 가능한 표로 표시합니다.
 if matches:
     search_df = pd.DataFrame([
-        {"의약품명": row.get("ITEM_NAME", ""), "제약사": row.get("ENTP_NAME", ""), "품목코드": row.get("ITEM_SEQ", "")}
+        {
+            "의약품명": row.get("ITEM_NAME", ""),
+            "제약사": row.get("ENTP_NAME", ""),
+            "성분명": clean_ingredient(row.get("MAIN_ITEM_INGR", "")) or search_detail_cache.get(str(row.get("ITEM_SEQ", "")), {}).get("성분명", ""),
+            "주성분 영문명": row.get("MAIN_INGR_ENG", "") or search_detail_cache.get(str(row.get("ITEM_SEQ", "")), {}).get("주성분영문명", ""),
+            "품목코드": row.get("ITEM_SEQ", ""),
+        }
         for row in matches
     ])
     search_event = st.dataframe(
@@ -1622,24 +1727,29 @@ selected_rows = [by_seq[seq] for seq in selected_seqs if seq in by_seq]
 section_header("3", "조회 설정")
 if "preset_new_drug_intro" not in st.session_state:
     st.session_state.preset_new_drug_intro = all(st.session_state.get(f"extra_{key}", False) for key in NEW_DRUG_PRESET_KEYS)
-if "preset_new_drug_intro_prev" not in st.session_state:
-    st.session_state.preset_new_drug_intro_prev = st.session_state.preset_new_drug_intro
-st.checkbox(
-    "[신약 도입 준비]",
-    key="preset_new_drug_intro",
-    help="영문 제품명, ATC 코드, 포장단위, 주성분 영문명, 원료약품 및 분량, 유효기간, 성상, 전문·일반의약품 구분, 보관정보, 보관 및 취급상의 주의사항을 한 번에 선택/해제합니다.",
-)
-if st.session_state.preset_new_drug_intro != st.session_state.preset_new_drug_intro_prev:
-    for preset_key in NEW_DRUG_PRESET_KEYS:
-        st.session_state[f"extra_{preset_key}"] = st.session_state.preset_new_drug_intro
-    st.session_state.preset_new_drug_intro_prev = st.session_state.preset_new_drug_intro
-    st.rerun()
+if "preset_all_fields" not in st.session_state:
+    st.session_state.preset_all_fields = all(st.session_state.get(f"extra_{key}", False) for key in EXTRA_FIELD_ORDER)
+preset_columns = st.columns(2)
+with preset_columns[0]:
+    st.checkbox(
+        "[신약 도입 준비]",
+        key="preset_new_drug_intro",
+        on_change=apply_new_drug_preset,
+        help="신약 도입 검토에 자주 쓰는 허가 항목을 한 번에 선택/해제합니다.",
+    )
+with preset_columns[1]:
+    st.checkbox(
+        "[전체] 식약처 제공 항목",
+        key="preset_all_fields",
+        on_change=apply_all_fields_preset,
+        help="기본·추가 항목과 함께 식약처 상세 API 응답의 원본 필드를 MFDS_열로 모두 가져옵니다.",
+    )
 
 selected_extras = []
 extra_columns = st.columns(3)
 for index, key in enumerate(EXTRA_FIELD_ORDER):
     with extra_columns[index % 3]:
-        if st.checkbox(EXTRA_FIELD_LABELS[key], key=f"extra_{key}"):
+        if st.checkbox(EXTRA_FIELD_LABELS[key], key=f"extra_{key}", on_change=sync_field_presets):
             selected_extras.append(key)
 
 summary_view = st.checkbox(
@@ -1666,7 +1776,8 @@ if st.button(lookup_button_label, type="primary", disabled=not selected_seqs or 
     selected_rows = [by_seq[seq] for seq in selected_seqs if seq in by_seq]
     with st.spinner("식약처 상세정보와 심평원 약가를 조회하는 중입니다…"):
         result_df, errors, reference_bundle = lookup_selected(
-            selected_rows, mfds_key, hira_key, selected_extras, price_reference_date, group_lookup
+            selected_rows, mfds_key, hira_key, selected_extras, price_reference_date, group_lookup,
+            include_all_fields=bool(st.session_state.get("preset_all_fields", False)),
         )
     st.session_state.last_result = result_df
     st.session_state.last_errors = errors
