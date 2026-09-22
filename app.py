@@ -31,12 +31,13 @@ LIST_CSV_FIELDS = [
     "ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", "CANCEL_NAME", "ITEM_PERMIT_DATE",
     "MAIN_ITEM_INGR", "MAIN_INGR_ENG",
 ]  # 바코드는 상세 API에서만 확인 가능
-BASE_COLUMNS = ["허가제품명", "제약사한글명", "약가", "약효분류", "주성분영문명", "성분명", "효능효과", "용법용량"]
+BASE_COLUMNS = ["허가제품명", "제약사한글명", "희귀의약품", "약가", "약효분류", "주성분영문명", "성분명", "효능효과", "용법용량"]
 HIRA_MEFT_FIELD = "meftDivNo"
 
 # 식약처 상세 응답에서 실제 확인된 직접 필드와 NB_DOC_DATA 문서 섹션입니다.
 # 사용자가 체크한 항목만 API 응답/캐시에서 결과로 펼칩니다.
 EXTRA_FIELD_SPECS = {
+    "희귀의약품": {"label": "희귀의약품", "source": "RARE_DRUG_YN", "transform": "direct"},
     "영문제품명": {"label": "영문 제품명", "source": "ITEM_ENG_NAME", "transform": "direct"},
     "주성분영문명": {"label": "주성분 영문명", "source": "MAIN_INGR_ENG", "transform": "direct"},
     "전문일반구분": {"label": "전문·일반의약품 구분", "source": "ETC_OTC_CODE", "transform": "direct"},
@@ -71,15 +72,21 @@ EXTRA_FIELD_ORDER = [
 ]
 EXTRA_FIELD_LABELS = {key: EXTRA_FIELD_SPECS[key]["label"] for key in EXTRA_FIELD_ORDER}
 EXTRA_FIELD_KEYWORDS = {key: EXTRA_FIELD_SPECS[key]["keywords"] for key in EXTRA_FIELD_ORDER if "keywords" in EXTRA_FIELD_SPECS[key]}
-EXTRA_DIRECT_FIELDS = {key: EXTRA_FIELD_SPECS[key]["source"] for key in EXTRA_FIELD_ORDER if EXTRA_FIELD_SPECS[key]["transform"] == "direct"}
+EXTRA_DIRECT_FIELDS = {
+    key: spec["source"] for key, spec in EXTRA_FIELD_SPECS.items()
+    if spec["transform"] == "direct"
+}
 NEW_DRUG_PRESET_KEYS = [
     "영문제품명", "ATC코드", "포장단위", "주성분영문명", "원료약품및분량",
     "유효기간", "성상", "전문일반구분", "보관정보", "보관_취급주의사항",
 ]
-ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명"]
-RESULT_COLUMN_ORDER = ["구분", "함량", "허가제품명", "제약사한글명", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
+ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명", "희귀의약품"]
+RESULT_COLUMN_ORDER = ["구분", "함량", "허가제품명", "제약사한글명", "희귀의약품", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
 MAX_RETRY = 5
+MFDS_RAW_EXCLUDED_FIELDS = {
+    "EE_DOC_DATA", "UD_DOC_DATA", "NB_DOC_DATA", "PN_DOC_DATA", "RARE_DRUG_YN",
+}
 
 DUR_CATEGORIES = [
     "병용금기(급여)", "병용금기(비급여)", "임부금기", "연령금기", "효능군중복",
@@ -107,6 +114,11 @@ KST = timezone(timedelta(hours=9))
 def clean_whitespace(text):
     if text is None:
         return ""
+    try:
+        if pd.isna(text):
+            return ""
+    except (TypeError, ValueError):
+        pass
     return re.sub(r"\s+", " ", str(text)).strip()
 
 
@@ -131,20 +143,6 @@ def parse_strength(text):
             return f"{amount}{unit}/{denominator_amount}{denominator_unit}"
         return f"{amount}{unit}"
     return ""
-
-
-def product_family_name(product_name):
-    """함량만 다른 동일 상품을 묶기 위해 제품명에서 대표 함량 표기를 제거합니다."""
-    value = clean_whitespace(product_name)
-    strength_patterns = [
-        r"(?i)\d+(?:\.\d+)?\s*(?:마이크로그램|μg|mcg|밀리그램|mg|그램|g)(?:\s*/\s*\d*(?:\.\d+)?\s*(?:mL|ml|밀리리터|정|캡슐|포|바이알))?",
-        r"(?i)\d+(?:\.\d+)?\s*(?:%|IU|U)(?:\s*/\s*\d*(?:\.\d+)?\s*(?:mL|ml|밀리리터))?",
-    ]
-    for pattern in strength_patterns:
-        value = re.sub(pattern, " ", value)
-    value = re.sub(r"[\s_\-]+", " ", value)
-    value = re.sub(r"\(\s*\)|\[\s*\]", "", value)
-    return clean_whitespace(value).strip("-_()[] ") or clean_whitespace(product_name)
 
 
 def group_label(group_id):
@@ -258,6 +256,22 @@ def clean_ingredient(text):
     if not text:
         return ""
     return clean_whitespace(re.sub(r"\[[A-Za-z0-9]+\]", "", text))
+
+
+def sanitize_all_api_fields(fields):
+    """전체 조회에서도 원본 XML 문서와 빈값은 제외해 의미 있는 필드만 남깁니다."""
+    sanitized = {}
+    for key, value in (fields or {}).items():
+        key = str(key)
+        cleaned = clean_whitespace(value)
+        if key in MFDS_RAW_EXCLUDED_FIELDS or key.endswith("_DOC_DATA"):
+            continue
+        if not cleaned or cleaned.casefold() == "nan":
+            continue
+        if "</PARAGRAPH>" in cleaned or cleaned.startswith("<DOC "):
+            continue
+        sanitized[key] = cleaned
+    return sanitized
 
 
 def unescape_html_repeated(text, rounds=3):
@@ -740,11 +754,11 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     cached["_bar_code"] = item.get("BAR_CODE", "")
     cached["_edi_code"] = item.get("EDI_CODE", "")
     cached["_raw_nb_xml"] = nb_xml
-    cached["_all_api_fields"] = {
+    cached["_all_api_fields"] = sanitize_all_api_fields({
         str(key): clean_whitespace(value)
         for key, value in item.items()
         if not isinstance(value, (dict, list))
-    }
+    })
     for key, field in EXTRA_DIRECT_FIELDS.items():
         cached["_raw_" + key] = clean_whitespace(item.get(field, ""))
     for key in wanted_extras:
@@ -1015,48 +1029,26 @@ def render_resizable_wrapped_table(display_df, show_index=False, height=720, tab
 
 
 def make_comparison_df(result_df):
-    """동일 상품의 여러 함량을 한 열에 모아 비교표를 생성합니다."""
+    """각 품목을 독립된 열로 표시하며 신청의약품은 맨 오른쪽에 배치합니다."""
     comparison = result_df.copy()
-    # 그룹 기능 사용 시 비교의약품을 먼저, 신청의약품을 맨 오른쪽에 배치합니다.
     if "구분" in comparison.columns:
         comparison["_그룹정렬"] = comparison["구분"].map(
             lambda value: 1 if clean_whitespace(value) == "신청의약품" else 0
         )
         comparison = comparison.sort_values("_그룹정렬", kind="stable").drop(columns=["_그룹정렬"])
-
-    grouped = {}
+    comparison_names = []
+    seen = {}
     for _, row in comparison.iterrows():
+        prefix = " ".join(
+            value for value in [clean_whitespace(row.get("구분", "")), clean_whitespace(row.get("함량", ""))]
+            if value
+        )
         product_name = clean_whitespace(row.get("허가제품명", "품목"))
-        family_name = product_family_name(product_name)
-        group_name = clean_whitespace(row.get("구분", ""))
-        manufacturer = clean_whitespace(row.get("제약사한글명", ""))
-        key = (group_name, family_name.casefold(), manufacturer.casefold())
-        grouped.setdefault(key, {"group": group_name, "family": family_name, "rows": []})["rows"].append(row)
-
-    columns = {}
-    seen_names = {}
-    for payload in grouped.values():
-        rows = payload["rows"]
-        header = " | ".join(value for value in [payload["group"], payload["family"]] if value)
-        seen_names[header] = seen_names.get(header, 0) + 1
-        column_name = header if seen_names[header] == 1 else f"{header} ({seen_names[header]})"
-        merged = {}
-        for field in comparison.columns:
-            values = []
-            for row in rows:
-                strength = clean_whitespace(row.get("함량", "")) or parse_strength(row.get("허가제품명", "")) or "함량 미상"
-                value = clean_whitespace(row.get(field, ""))
-                values.append((strength, value))
-            if len(values) == 1:
-                merged[field] = values[0][1]
-            elif field == "구분":
-                merged[field] = payload["group"]
-            elif field == "함량":
-                merged[field] = "\n".join(dict.fromkeys(strength for strength, _ in values))
-            else:
-                merged[field] = "\n".join(f"{strength}: {value}" for strength, value in values)
-        columns[column_name] = merged
-    result = pd.DataFrame(columns)
+        name = f"{prefix} | {product_name}" if prefix else product_name
+        seen[name] = seen.get(name, 0) + 1
+        comparison_names.append(name if seen[name] == 1 else f"{name} ({seen[name]})")
+    comparison["_비교용약품명"] = comparison_names
+    result = comparison.set_index("_비교용약품명").T
     result.index.name = "조회 항목"
     return result
 
@@ -1088,11 +1080,11 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
             item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors, as_of_date
         )
         effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
-        out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "약가": format_price(price), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": clean_whitespace((price_item or {}).get("mdsCd", "")), "약가적용시작일": clean_whitespace((price_item or {}).get("adtStaDd", "")), "판매예정종료일": clean_whitespace((price_item or {}).get("sellEptDd", "")), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
+        out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "희귀의약품": detail.get("희귀의약품", ""), "약가": format_price(price), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": clean_whitespace((price_item or {}).get("mdsCd", "")), "약가적용시작일": clean_whitespace((price_item or {}).get("adtStaDd", "")), "판매예정종료일": clean_whitespace((price_item or {}).get("sellEptDd", "")), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
         if include_all_fields:
-            for api_key, api_value in detail.get("_all_api_fields", {}).items():
+            for api_key, api_value in sanitize_all_api_fields(detail.get("_all_api_fields", {})).items():
                 out_row.setdefault(f"MFDS_{api_key}", api_value)
         output.append(out_row)
         reference_items.append({
@@ -1108,10 +1100,11 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
                 "manufacturer": entp_name,
                 "bar_code": clean_whitespace(bar_code),
                 "ingredient": detail.get("성분명", ""),
+                "rare_drug_yn": detail.get("희귀의약품", ""),
                 "indications_text": detail.get("효능효과", ""),
                 "dosage_text": detail.get("용법용량", ""),
                 "selected_extra_fields": {key: detail.get(key, "") for key in wanted_extras},
-                "all_api_fields": detail.get("_all_api_fields", {}) if include_all_fields else None,
+                "all_api_fields": sanitize_all_api_fields(detail.get("_all_api_fields", {})) if include_all_fields else None,
             },
             "hira": {
                 "reference_date": as_of_date.isoformat(),
@@ -1742,7 +1735,7 @@ with preset_columns[1]:
         "[전체] 식약처 제공 항목",
         key="preset_all_fields",
         on_change=apply_all_fields_preset,
-        help="기본·추가 항목과 함께 식약처 상세 API 응답의 원본 필드를 MFDS_열로 모두 가져옵니다.",
+        help="기본·추가 항목과 의미 있는 식약처 상세 필드를 MFDS_열로 가져옵니다. XML 원문과 빈 필드는 제외합니다.",
     )
 
 selected_extras = []
