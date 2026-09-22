@@ -74,7 +74,7 @@ NEW_DRUG_PRESET_KEYS = [
     "유효기간", "성상", "전문일반구분", "보관정보", "보관_취급주의사항",
 ]
 ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명"]
-RESULT_COLUMN_ORDER = ["허가제품명", "제약사한글명", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
+RESULT_COLUMN_ORDER = ["구분", "함량", "허가제품명", "제약사한글명", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
 MAX_RETRY = 5
 
@@ -105,6 +105,111 @@ def clean_whitespace(text):
     if text is None:
         return ""
     return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def parse_strength(text):
+    """제품명에서 대표 함량을 보수적으로 추출합니다. 사용자가 그룹 표에서 수정할 수 있습니다."""
+    value = clean_whitespace(text)
+    patterns = [
+        r"(?i)(\d+(?:\.\d+)?)\s*(마이크로그램|μg|mcg|밀리그램|mg|그램|g)(?:\s*/\s*(\d+(?:\.\d+)?)?\s*(mL|ml|밀리리터|정|캡슐|포|바이알))?",
+        r"(?i)(\d+(?:\.\d+)?)\s*(%|IU|U)(?:\s*/\s*(\d+(?:\.\d+)?)?\s*(mL|ml|밀리리터))?",
+    ]
+    unit_map = {"마이크로그램": "μg", "밀리그램": "mg", "그램": "g", "밀리리터": "mL", "ml": "mL"}
+    for pattern in patterns:
+        match = re.search(pattern, value)
+        if not match:
+            continue
+        groups = match.groups()
+        amount = groups[0]
+        unit = unit_map.get(groups[1], groups[1])
+        if len(groups) >= 4 and groups[3]:
+            denominator_amount = groups[2] or "1"
+            denominator_unit = unit_map.get(groups[3], groups[3])
+            return f"{amount}{unit}/{denominator_amount}{denominator_unit}"
+        return f"{amount}{unit}"
+    return ""
+
+
+def group_label(group_id):
+    if group_id == "applicant":
+        return "신청의약품"
+    number = re.sub(r"\D", "", str(group_id)) or "1"
+    return f"비교의약품{number}"
+
+
+def ordered_group_ids(groups):
+    comparator_ids = [gid for gid in groups if gid.startswith("comparator_")]
+    comparator_ids.sort(key=lambda gid: int(re.sub(r"\D", "", gid) or 0))
+    return ["applicant"] + comparator_ids
+
+
+def ensure_group_state():
+    groups = st.session_state.get("groups")
+    if not isinstance(groups, dict):
+        legacy = [str(seq) for seq in st.session_state.get("selection", []) if str(seq)]
+        groups = {
+            "applicant": {"label": "신청의약품", "seqs": legacy},
+            "comparator_1": {"label": "비교의약품1", "seqs": []},
+        }
+    groups.setdefault("applicant", {"label": "신청의약품", "seqs": []})
+    if not any(gid.startswith("comparator_") for gid in groups):
+        groups["comparator_1"] = {"label": "비교의약품1", "seqs": []}
+    for gid in ordered_group_ids(groups):
+        groups[gid].setdefault("label", group_label(gid))
+        groups[gid]["seqs"] = list(dict.fromkeys(str(seq) for seq in groups[gid].get("seqs", []) if str(seq)))
+    st.session_state.groups = groups
+    st.session_state.setdefault("strength_overrides", {})
+
+
+def flatten_group_seqs():
+    return [seq for gid in ordered_group_ids(st.session_state.groups) for seq in st.session_state.groups[gid]["seqs"]]
+
+
+def sync_selection_from_groups():
+    st.session_state.selection = flatten_group_seqs() if isinstance(st.session_state.get("groups"), dict) else []
+
+
+def next_comparator_group_id():
+    used = [int(re.sub(r"\D", "", gid) or 0) for gid in st.session_state.groups if gid.startswith("comparator_")]
+    return f"comparator_{max(used, default=0) + 1}"
+
+
+def assign_seqs_to_group(target_gid, seqs):
+    selected = [str(seq) for seq in seqs if str(seq)]
+    for meta in st.session_state.groups.values():
+        meta["seqs"] = [seq for seq in meta.get("seqs", []) if seq not in selected]
+    target = st.session_state.groups[target_gid]["seqs"]
+    target.extend(seq for seq in selected if seq not in target)
+    sync_selection_from_groups()
+
+
+def remove_group_seqs(group_id, seqs):
+    removing = {str(seq) for seq in seqs}
+    st.session_state.groups[group_id]["seqs"] = [seq for seq in st.session_state.groups[group_id]["seqs"] if seq not in removing]
+    for seq in removing:
+        st.session_state.strength_overrides.pop(seq, None)
+    sync_selection_from_groups()
+
+
+def build_group_items(by_seq):
+    items = []
+    for gid in ordered_group_ids(st.session_state.groups):
+        meta = st.session_state.groups[gid]
+        for seq in meta["seqs"]:
+            row = by_seq.get(seq)
+            if not row:
+                continue
+            parsed = parse_strength(row.get("ITEM_NAME", ""))
+            items.append({
+                "group_id": gid,
+                "group_label": meta["label"],
+                "seq": seq,
+                "item_name": row.get("ITEM_NAME", ""),
+                "entp_name": row.get("ENTP_NAME", ""),
+                "parsed_strength": parsed,
+                "strength": st.session_state.strength_overrides.get(seq, parsed),
+            })
+    return items
 
 
 def clean_ingredient(text):
@@ -808,6 +913,15 @@ def render_resizable_wrapped_table(display_df, show_index=False, height=720, tab
       .resize-handle {{ position:absolute; top:0; right:-4px; width:8px; height:100%; cursor:col-resize; z-index:3; }}
       .resize-handle:hover, .resizing {{ background:#5b8def; opacity:.55; }}
       body.resizing {{ cursor:col-resize; user-select:none; }}
+      @media (prefers-color-scheme: dark) {{
+        html, body {{ background:#111923; color:#e6edf5; color-scheme:dark; }}
+        .table-wrap {{ border-color:#344354; background:#111923; }}
+        th, td {{ border-color:#344354; color:#e6edf5; }}
+        th {{ background:#1b2a3a; color:#f5f9fd; }}
+        tr:nth-child(even) td {{ background:#151f2b; }}
+        tr:hover td {{ background:#1b3142; }}
+        .resize-handle:hover, .resizing {{ background:#42c7c1; }}
+      }}
     </style>
     <div class="table-wrap" id="wrap-{table_key}">
       <table id="table-{table_key}"><colgroup>{colgroup}</colgroup><thead><tr>{header_html}</tr></thead><tbody>{''.join(body_html)}</tbody></table>
@@ -847,10 +961,21 @@ def render_resizable_wrapped_table(display_df, show_index=False, height=720, tab
 def make_comparison_df(result_df):
     """행에는 조회 항목, 열에는 의약품을 배치한 비교표를 생성합니다."""
     comparison = result_df.copy()
+    # 그룹 기능 사용 시 비교의약품을 먼저, 신청의약품을 맨 오른쪽에 배치합니다.
+    if "구분" in comparison.columns:
+        comparison["_그룹정렬"] = comparison["구분"].map(
+            lambda value: 1 if clean_whitespace(value) == "신청의약품" else 0
+        )
+        comparison = comparison.sort_values("_그룹정렬", kind="stable").drop(columns=["_그룹정렬"])
     comparison_names = []
     seen = {}
     for _, row in comparison.iterrows():
-        name = str(row.get("허가제품명", "품목"))
+        prefix = " ".join(
+            value for value in [clean_whitespace(row.get("구분", "")), clean_whitespace(row.get("함량", ""))]
+            if value
+        )
+        product_name = clean_whitespace(row.get("허가제품명", "품목"))
+        name = f"{prefix} | {product_name}" if prefix else product_name
         seen[name] = seen.get(name, 0) + 1
         comparison_names.append(name if seen[name] == 1 else f"{name} ({seen[name]})")
     comparison["_비교용약품명"] = comparison_names
@@ -859,7 +984,7 @@ def make_comparison_df(result_df):
     return comparison
 
 
-def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date):
+def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_lookup=None):
     cache_code = load_json_cache(CACHE_CODE_FILE)
     cache_name = load_json_cache(CACHE_NAME_FILE)
     cache_detail = load_json_cache(CACHE_DETAIL_FILE)
@@ -874,6 +999,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date):
         item_seq = row.get("ITEM_SEQ", "")
         item_name = clean_whitespace(row.get("ITEM_NAME", ""))
         entp_name = clean_whitespace(row.get("ENTP_NAME", ""))
+        group_meta = (group_lookup or {}).get(str(item_seq), {})
         # 목록 API에는 바코드가 없으므로, 상세 API(fetch_detail)를 먼저 불러 실제 바코드를 얻습니다.
         fetch_keys = list(dict.fromkeys(ALWAYS_FETCH_DETAIL_KEYS + wanted_extras))
         detail = fetch_detail(item_seq, mfds_key, call_counter, cache_detail, fetch_keys, errors)
@@ -882,11 +1008,17 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date):
             item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors, as_of_date
         )
         effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
-        out_row = {"허가제품명": item_name, "제약사한글명": entp_name, "약가": format_price(price), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": clean_whitespace((price_item or {}).get("mdsCd", "")), "약가적용시작일": clean_whitespace((price_item or {}).get("adtStaDd", "")), "판매예정종료일": clean_whitespace((price_item or {}).get("sellEptDd", "")), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
+        out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "약가": format_price(price), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": clean_whitespace((price_item or {}).get("mdsCd", "")), "약가적용시작일": clean_whitespace((price_item or {}).get("adtStaDd", "")), "판매예정종료일": clean_whitespace((price_item or {}).get("sellEptDd", "")), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
         output.append(out_row)
         reference_items.append({
+            "group": {
+                "id": group_meta.get("group_id", ""),
+                "label": group_meta.get("group_label", ""),
+                "strength": group_meta.get("strength", ""),
+                "parsed_strength": group_meta.get("parsed_strength", ""),
+            },
             "mfds": {
                 "item_seq": item_seq,
                 "product_name": item_name,
@@ -915,7 +1047,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date):
     save_json_cache(CACHE_DETAIL_FILE, cache_detail)
     save_json_cache(CACHE_MEFT_FILE, cache_meft)
     reference_bundle = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "reference_date": as_of_date.isoformat(),
         "generated_at": datetime.now(KST).isoformat(timespec="seconds"),
         "product_count": len(reference_items),
@@ -975,12 +1107,291 @@ def check_dur(rows, mfds_key, dur_indices, cache_detail, call_counter, errors):
     return pd.DataFrame(result_rows, columns=columns)
 
 
-st.set_page_config(page_title="의약품 통합 조회", page_icon="💊", layout="wide")
-st.title("💊 의약품 허가정보·약가 통합 조회")
-st.caption("식약처 허가·상세정보와 심평원 약가를 결합해 조회합니다. 데이터의 기준일과 API 응답을 함께 확인하세요.")
+st.set_page_config(
+    page_title="의약품 통합 조회",
+    page_icon="💊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    :root {
+        --ink: #10243e;
+        --muted: #617086;
+        --line: #dbe4ee;
+        --surface: #ffffff;
+        --surface-soft: #f5f8fc;
+        --brand: #146c94;
+        --brand-dark: #0d4f72;
+        --accent: #19a7a0;
+    }
+
+    .stApp {
+        background:
+            radial-gradient(circle at 92% 0%, rgba(25, 167, 160, .10), transparent 28rem),
+            linear-gradient(180deg, #f8fbfe 0%, #f3f7fb 100%);
+        color: var(--ink);
+    }
+    .block-container {
+        max-width: 1440px;
+        padding-top: 2.25rem;
+        padding-bottom: 4rem;
+    }
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0f3550 0%, #102b42 100%);
+        border-right: 0;
+    }
+    [data-testid="stSidebar"] * { color: #f6fbff; }
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p { color: #bad0df; }
+    [data-testid="stSidebar"] hr { border-color: rgba(255,255,255,.14); }
+    [data-testid="stSidebar"] .stTextInput input {
+        background: rgba(255,255,255,.10);
+        border-color: rgba(255,255,255,.22);
+        color: #fff;
+    }
+    .app-hero {
+        position: relative;
+        overflow: hidden;
+        padding: 1.75rem 2rem;
+        margin-bottom: 1.5rem;
+        border: 1px solid rgba(20,108,148,.13);
+        border-radius: 22px;
+        background: linear-gradient(135deg, rgba(255,255,255,.98), rgba(235,247,250,.96));
+        box-shadow: 0 14px 40px rgba(31, 78, 121, .08);
+    }
+    .app-hero::after {
+        content: "";
+        position: absolute;
+        width: 210px;
+        height: 210px;
+        right: -55px;
+        top: -95px;
+        border-radius: 50%;
+        background: linear-gradient(145deg, rgba(20,108,148,.17), rgba(25,167,160,.06));
+    }
+    .hero-kicker {
+        display: inline-flex;
+        align-items: center;
+        gap: .4rem;
+        padding: .3rem .65rem;
+        border-radius: 999px;
+        color: var(--brand-dark);
+        background: #e2f2f5;
+        font-size: .78rem;
+        font-weight: 700;
+        letter-spacing: .04em;
+    }
+    .app-hero h1 {
+        margin: .8rem 0 .4rem;
+        color: var(--ink);
+        font-size: clamp(1.75rem, 3vw, 2.55rem);
+        line-height: 1.15;
+        letter-spacing: -.035em;
+    }
+    .app-hero p {
+        margin: 0;
+        max-width: 760px;
+        color: var(--muted);
+        font-size: 1rem;
+        line-height: 1.65;
+    }
+    .section-title {
+        display: flex;
+        align-items: center;
+        gap: .75rem;
+        margin: 2rem 0 .85rem;
+        color: var(--ink);
+        font-size: 1.18rem;
+        font-weight: 750;
+    }
+    .section-step {
+        display: inline-grid;
+        place-items: center;
+        width: 1.8rem;
+        height: 1.8rem;
+        border-radius: 10px;
+        color: #fff;
+        background: linear-gradient(135deg, var(--brand), var(--accent));
+        font-size: .82rem;
+        box-shadow: 0 5px 14px rgba(20,108,148,.2);
+    }
+    div[data-testid="stForm"],
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        border-color: var(--line);
+        border-radius: 16px;
+    }
+    .stButton > button, .stDownloadButton > button {
+        min-height: 2.75rem;
+        border-radius: 11px;
+        border: 1px solid #c9d7e5;
+        font-weight: 700;
+        transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        transform: translateY(-1px);
+        border-color: var(--brand);
+        box-shadow: 0 8px 18px rgba(20,108,148,.12);
+    }
+    .stButton > button[kind="primary"] {
+        border: 0;
+        color: #fff;
+        background: linear-gradient(135deg, var(--brand-dark), var(--brand));
+    }
+    .stTextInput input, .stDateInput input, [data-baseweb="select"] > div {
+        border-radius: 10px !important;
+        border-color: #cfdae6 !important;
+        background: rgba(255,255,255,.92);
+    }
+    [data-testid="stDataFrame"] {
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        box-shadow: 0 6px 20px rgba(31,78,121,.05);
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: .35rem;
+        padding: .3rem;
+        border-radius: 13px;
+        background: #eaf0f6;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 2.7rem;
+        padding: 0 1.05rem;
+        border-radius: 9px;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #fff;
+        box-shadow: 0 3px 10px rgba(31,78,121,.10);
+    }
+    [data-testid="stAlert"] { border-radius: 13px; }
+    [data-testid="stExpander"] {
+        overflow: hidden;
+        border-color: var(--line);
+        border-radius: 13px;
+        background: rgba(255,255,255,.72);
+    }
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --ink: #edf4fa;
+            --muted: #a9bacb;
+            --line: #33475b;
+            --surface: #121c27;
+            --surface-soft: #172431;
+            --brand: #39a9d0;
+            --brand-dark: #1889b2;
+            --accent: #42c7c1;
+            color-scheme: dark;
+        }
+        .stApp {
+            background:
+                radial-gradient(circle at 92% 0%, rgba(66, 199, 193, .12), transparent 28rem),
+                linear-gradient(180deg, #0d151e 0%, #111b26 100%);
+            color: var(--ink);
+        }
+        .stApp p, .stApp label, .stApp li, .stApp span,
+        .stMarkdown, [data-testid="stCaptionContainer"] p {
+            color: #dce7f1;
+        }
+        .app-hero {
+            border-color: #2c5268;
+            background: linear-gradient(135deg, rgba(22,37,50,.98), rgba(17,49,59,.96));
+            box-shadow: 0 16px 44px rgba(0,0,0,.30);
+        }
+        .app-hero::after {
+            background: linear-gradient(145deg, rgba(57,169,208,.22), rgba(66,199,193,.07));
+        }
+        .hero-kicker {
+            color: #d9fbf8 !important;
+            background: rgba(66,199,193,.16);
+            border: 1px solid rgba(66,199,193,.24);
+        }
+        .app-hero h1, .section-title, .section-title span { color: #f3f8fc; }
+        .app-hero p { color: #b8c8d7; }
+        [data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #0a2233 0%, #0b1b29 100%);
+            border-right: 1px solid #233b4d;
+        }
+        [data-testid="stSidebar"] * { color: #edf7ff; }
+        .stTextInput input, .stDateInput input, [data-baseweb="select"] > div,
+        [data-baseweb="input"] {
+            color: #edf4fa !important;
+            caret-color: #67d7d1;
+            border-color: #3a5166 !important;
+            background: #162330 !important;
+        }
+        .stTextInput input::placeholder { color: #8194a7; opacity: 1; }
+        [data-baseweb="popover"], [role="listbox"] {
+            color: #edf4fa;
+            background: #182633 !important;
+        }
+        .stButton > button, .stDownloadButton > button {
+            color: #eaf3fa;
+            border-color: #3a5268;
+            background: #172635;
+        }
+        .stButton > button:hover, .stDownloadButton > button:hover {
+            color: #ffffff;
+            border-color: #4bbbd8;
+            background: #1b3041;
+            box-shadow: 0 8px 20px rgba(0,0,0,.24);
+        }
+        .stButton > button[kind="primary"] {
+            color: #ffffff;
+            background: linear-gradient(135deg, #126f96, #15998f);
+        }
+        [data-testid="stDataFrame"] {
+            border-color: #34475a;
+            background: #111b26;
+            box-shadow: 0 7px 24px rgba(0,0,0,.20);
+        }
+        .stTabs [data-baseweb="tab-list"] { background: #172431; }
+        .stTabs [data-baseweb="tab"] { color: #b8c7d5; }
+        .stTabs [aria-selected="true"] {
+            color: #f6fbff;
+            background: #24384a;
+            box-shadow: 0 4px 12px rgba(0,0,0,.22);
+        }
+        [data-testid="stExpander"] {
+            border-color: #33475b;
+            background: rgba(20,32,44,.88);
+        }
+        [data-testid="stAlert"] {
+            border-color: #3c5368;
+            color: #edf4fa;
+        }
+        hr { border-color: #314355; }
+        code, pre {
+            color: #d9eff7 !important;
+            background: #0b141d !important;
+        }
+    }
+    @media (max-width: 720px) {
+        .block-container { padding: 1rem .85rem 2.5rem; }
+        .app-hero { padding: 1.25rem; border-radius: 17px; }
+        .app-hero p { font-size: .92rem; }
+        .stTabs [data-baseweb="tab"] { padding: 0 .55rem; }
+    }
+    </style>
+    <div class="app-hero">
+      <span class="hero-kicker">OFFICIAL DRUG REFERENCE</span>
+      <h1>의약품 허가정보·약가 통합 조회</h1>
+      <p>식약처 허가사항과 심평원 급여약가를 한 화면에서 조회하고, 비교표와 AI 검토용 공식 레퍼런스를 생성합니다.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def section_header(step, title):
+    st.markdown(
+        f'<div class="section-title"><span class="section-step">{step}</span><span>{title}</span></div>',
+        unsafe_allow_html=True,
+    )
 
 with st.sidebar:
-    st.header("설정")
+    st.header("환경 설정")
     try:
         secret_mfds = st.secrets.get("MFDS_KEY", "")
         secret_hira = st.secrets.get("HIRA_KEY", "")
@@ -1024,29 +1435,6 @@ with st.sidebar:
     st.divider()
     st.markdown("**저장 위치**")
     st.code(str(DATA_DIR), language="text")
-    st.divider()
-    st.markdown("**DUR 품목리스트 업로드**")
-    st.caption("엑셀에 '제품코드'(또는 제품코드A/B, 약품코드) 열이 있어야 합니다. 매달 새 파일로 다시 올리면 그 종류만 갱신됩니다.")
-    if "dur_indices" not in st.session_state:
-        st.session_state.dur_indices = {}
-    for category in DUR_CATEGORIES:
-        uploaded = st.file_uploader(category, type=["xlsx", "xls", "xlsb"], key=f"dur_upload_{category}")
-        if uploaded is not None:
-            try:
-                # 파일 내용이 바뀌지 않았으면 다시 읽지 않습니다 (그래서 검색창 등 다른 위젯을
-                # 조작해도 매번 재파싱으로 느려지지 않습니다).
-                dur_df, header_row, dur_index, code_columns = parse_dur_excel_cached(uploaded.getvalue(), uploaded.name)
-            except Exception as exc:
-                st.error(f"[{category}] '{uploaded.name}' 읽기 실패: {exc}")
-            else:
-                if not code_columns:
-                    st.warning(
-                        f"[{category}] '{uploaded.name}'에서 제품코드/약품코드 열을 찾지 못했습니다. "
-                        f"(헤더로 인식한 행: {header_row}, 전체 열: {list(dur_df.columns)})"
-                    )
-                else:
-                    st.session_state.dur_indices[category] = dur_index
-                    st.success(f"[{category}] {len(dur_df):,}행, 코드열 {code_columns}, 매칭 제품코드 {len(dur_index):,}종 적용됨")
 
 cache_day = current_kst_date()
 cache_fresh = list_cache_is_fresh()
@@ -1069,15 +1457,55 @@ st.success(f"정상 품목 {len(normal_rows):,}건 준비 완료")
 
 if "selection" not in st.session_state:
     st.session_state.selection = []
+ensure_group_state()
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
 if "last_errors" not in st.session_state:
     st.session_state.last_errors = []
 if "last_reference_json" not in st.session_state:
     st.session_state.last_reference_json = None
+if "group_mode" not in st.session_state:
+    st.session_state.group_mode = False
 
-st.subheader("1. 의약품 검색")
+section_header("1", "의약품 검색")
+with st.container(border=True):
+    st.markdown("**조회 방식**")
+    group_mode = st.toggle(
+        "신청의약품 · 비교의약품 그룹으로 관리",
+        key="group_mode",
+        help="필요할 때만 켜세요. 끄면 모든 품목을 하나의 일반 조회 목록으로 관리합니다.",
+    )
+    st.caption("비교표를 그룹·함량별로 만들 때만 켜세요. 기본 조회에서는 끈 상태로 사용합니다.")
+previous_group_mode = st.session_state.get("group_mode_previous", group_mode)
+if group_mode and not previous_group_mode:
+    grouped_seqs = set(flatten_group_seqs())
+    st.session_state.groups["applicant"]["seqs"].extend(
+        seq for seq in st.session_state.selection if seq not in grouped_seqs
+    )
+elif not group_mode and previous_group_mode:
+    st.session_state.selection = list(dict.fromkeys(flatten_group_seqs()))
+st.session_state.group_mode_previous = group_mode
+
 query = st.text_input("의약품명 또는 제약사명", placeholder="예: 타이레놀, 한미약품")
+target_group_id = None
+if group_mode:
+    target_col, add_group_col = st.columns([3, 1])
+    with target_col:
+        if st.session_state.get("search_target_group") not in st.session_state.groups:
+            st.session_state.search_target_group = "applicant"
+        target_group_id = st.selectbox(
+            "선택 품목을 추가할 그룹",
+            options=ordered_group_ids(st.session_state.groups),
+            format_func=lambda gid: st.session_state.groups[gid]["label"],
+            key="search_target_group",
+        )
+    with add_group_col:
+        st.write("")
+        st.write("")
+        if st.button("＋ 비교약 그룹 추가", use_container_width=True):
+            new_gid = next_comparator_group_id()
+            st.session_state.groups[new_gid] = {"label": group_label(new_gid), "seqs": []}
+            st.rerun()
 matches = []
 if query.strip():
     q = query.strip().casefold()
@@ -1107,39 +1535,91 @@ if matches:
         if 0 <= index < len(search_df)
     ]
     st.caption(f"검색 결과에서 선택한 품목: **{len(search_selected_seqs)}건**")
-    if st.button("선택한 검색 결과를 조회 목록에 추가", disabled=not search_selected_seqs, key="add_search_selection"):
-        for seq in search_selected_seqs:
-            if seq and seq not in st.session_state.selection:
-                st.session_state.selection.append(seq)
-        st.rerun()
-
-st.subheader("2. 조회할 품목")
-selected_rows = [by_seq[seq] for seq in st.session_state.selection if seq in by_seq]
-if selected_rows:
-    selected_df = pd.DataFrame([
-        {"의약품명": row.get("ITEM_NAME", ""), "제약사": row.get("ENTP_NAME", ""), "품목코드": row.get("ITEM_SEQ", "")}
-        for row in selected_rows
-    ])
-    st.caption("아래 표에서 제거할 행을 선택한 뒤 버튼을 누르세요.")
-    selected_event = st.dataframe(
-        selected_df,
-        use_container_width=True,
-        hide_index=True,
-        height=min(360, 36 + len(selected_df) * 35),
-        selection_mode="multi-row",
-        on_select="rerun",
-        key="selected_items_table",
+    add_label = (
+        f"선택한 품목을 {st.session_state.groups[target_group_id]['label']}에 추가"
+        if group_mode else "선택한 품목을 조회 목록에 추가"
     )
-    if st.button("선택한 품목 제거", disabled=not selected_event.selection.rows):
-        remove_seq = {str(selected_df.iloc[index]["품목코드"]) for index in selected_event.selection.rows}
-        st.session_state.selection = [seq for seq in st.session_state.selection if seq not in remove_seq]
+    if st.button(add_label, disabled=not search_selected_seqs, key="add_search_selection"):
+        if group_mode:
+            assign_seqs_to_group(target_group_id, search_selected_seqs)
+        else:
+            st.session_state.selection.extend(
+                seq for seq in search_selected_seqs if seq not in st.session_state.selection
+            )
         st.rerun()
+
+if group_mode:
+    section_header("2", "신청의약품 · 비교의약품 그룹")
+    st.caption("함량은 제품명에서 자동 파싱됩니다. 잘못되었거나 비어 있으면 표에서 직접 수정하고, 제거할 행은 체크하세요.")
+    group_items = build_group_items(by_seq)
+    for gid in ordered_group_ids(st.session_state.groups):
+        group_meta = st.session_state.groups[gid]
+        items = [item for item in group_items if item["group_id"] == gid]
+        with st.expander(f"{group_meta['label']} · {len(items)}개 품목", expanded=(gid == "applicant" or bool(items))):
+            if not items:
+                st.info("검색 결과에서 품목을 선택해 이 그룹에 추가하세요.")
+            else:
+                editor_df = pd.DataFrame([
+                    {
+                        "의약품명": item["item_name"], "제약사": item["entp_name"], "품목코드": item["seq"],
+                        "함량": item["strength"], "자동파싱": item["parsed_strength"], "제거": False,
+                    }
+                    for item in items
+                ])
+                edited_df = st.data_editor(
+                    editor_df, use_container_width=True, hide_index=True,
+                    disabled=["의약품명", "제약사", "품목코드", "자동파싱"],
+                    column_config={
+                        "함량": st.column_config.TextColumn("함량(수정 가능)", help="비교표와 JSON에 반영될 함량입니다."),
+                        "자동파싱": st.column_config.TextColumn("자동 파싱값"),
+                        "제거": st.column_config.CheckboxColumn("제거"),
+                    }, key=f"group_editor_{gid}",
+                )
+                for _, edited_row in edited_df.iterrows():
+                    seq = str(edited_row["품목코드"])
+                    st.session_state.strength_overrides[seq] = clean_whitespace(edited_row["함량"])
+                remove_seqs = edited_df.loc[edited_df["제거"] == True, "품목코드"].astype(str).tolist()
+                if st.button("체크한 품목 제거", disabled=not remove_seqs, key=f"remove_group_items_{gid}"):
+                    remove_group_seqs(gid, remove_seqs)
+                    st.rerun()
+            if gid != "applicant" and st.button("이 비교약 그룹 삭제", key=f"delete_group_{gid}"):
+                for seq in group_meta["seqs"]:
+                    st.session_state.strength_overrides.pop(seq, None)
+                del st.session_state.groups[gid]
+                sync_selection_from_groups()
+                st.rerun()
+    selected_seqs = flatten_group_seqs()
+    group_counts = " · ".join(
+        f"{st.session_state.groups[gid]['label']} {len(st.session_state.groups[gid]['seqs'])}개"
+        for gid in ordered_group_ids(st.session_state.groups)
+    )
+    st.write(f"현재 선택: **총 {len(selected_seqs)}개 품목** ({group_counts})")
 else:
-    st.info("1번 검색 결과 표에서 조회할 행을 클릭하세요.")
+    section_header("2", "조회할 품목")
+    selected_seqs = [seq for seq in st.session_state.selection if seq in by_seq]
+    if selected_seqs:
+        selected_df = pd.DataFrame([
+            {"의약품명": by_seq[seq].get("ITEM_NAME", ""), "제약사": by_seq[seq].get("ENTP_NAME", ""), "품목코드": seq}
+            for seq in selected_seqs
+        ])
+        selected_event = st.dataframe(
+            selected_df, use_container_width=True, hide_index=True,
+            selection_mode="multi-row", on_select="rerun", key="selected_items_table",
+        )
+        remove_seqs = {
+            str(selected_df.iloc[index]["품목코드"])
+            for index in selected_event.selection.rows if 0 <= index < len(selected_df)
+        }
+        if st.button("선택한 품목 제거", disabled=not remove_seqs, key="remove_selected_items"):
+            st.session_state.selection = [seq for seq in st.session_state.selection if seq not in remove_seqs]
+            st.rerun()
+    else:
+        st.info("검색 결과에서 조회할 품목을 추가하세요.")
+    st.write(f"현재 선택: **총 {len(selected_seqs)}개 품목**")
 
-st.write(f"현재 선택된 품목: **{len(st.session_state.selection)}건**")
+selected_rows = [by_seq[seq] for seq in selected_seqs if seq in by_seq]
 
-st.subheader("3. 추가 조회 항목")
+section_header("3", "조회 설정")
 if "preset_new_drug_intro" not in st.session_state:
     st.session_state.preset_new_drug_intro = all(st.session_state.get(f"extra_{key}", False) for key in NEW_DRUG_PRESET_KEYS)
 if "preset_new_drug_intro_prev" not in st.session_state:
@@ -1173,11 +1653,20 @@ price_reference_date = st.date_input(
     help="이 날짜에 적용 중인 약가 이력만 선택합니다. 적용 시작일과 판매 종료일을 함께 판정합니다.",
 )
 
-if st.button("선택한 품목 조회", type="primary", disabled=not st.session_state.selection or not (mfds_key and hira_key)):
-    selected_rows = [by_seq[seq] for seq in st.session_state.selection if seq in by_seq]
+applicant_ready = not group_mode or bool(st.session_state.groups["applicant"]["seqs"])
+if group_mode and not applicant_ready and selected_seqs:
+    st.warning("조회하려면 신청의약품 그룹에 품목을 하나 이상 추가하세요.")
+
+lookup_button_label = "그룹 전체 품목 조회" if group_mode else "선택한 품목 조회"
+if st.button(lookup_button_label, type="primary", disabled=not selected_seqs or not applicant_ready or not (mfds_key and hira_key)):
+    group_lookup = None
+    if group_mode:
+        current_group_items = build_group_items(by_seq)
+        group_lookup = {item["seq"]: item for item in current_group_items}
+    selected_rows = [by_seq[seq] for seq in selected_seqs if seq in by_seq]
     with st.spinner("식약처 상세정보와 심평원 약가를 조회하는 중입니다…"):
         result_df, errors, reference_bundle = lookup_selected(
-            selected_rows, mfds_key, hira_key, selected_extras, price_reference_date
+            selected_rows, mfds_key, hira_key, selected_extras, price_reference_date, group_lookup
         )
     st.session_state.last_result = result_df
     st.session_state.last_errors = errors
@@ -1185,11 +1674,11 @@ if st.button("선택한 품목 조회", type="primary", disabled=not st.session_
     st.rerun()
 
 if st.session_state.last_result is not None:
-    st.subheader("조회 결과")
+    section_header("4", "조회 결과")
     result_df = st.session_state.last_result
     filtered_result_df = result_df
 
-    result_tab, comparison_tab, dur_tab = st.tabs(["상세 결과", "여러 약품 비교표", "DUR 확인"])
+    result_tab, comparison_tab = st.tabs(["상세 결과", "여러 약품 비교표"])
 
     with result_tab:
         transpose_view = st.checkbox(
@@ -1223,43 +1712,14 @@ if st.session_state.last_result is not None:
             st.info("두 품목 이상 조회하면 비교표가 표시됩니다.")
         else:
             comparison_df = make_comparison_df(make_summary_df(filtered_result_df) if summary_view else filtered_result_df)
-            st.caption("행은 조회 항목, 열은 의약품입니다. 헤더 경계를 드래그해 약품별 컬럼 너비를 조절할 수 있습니다.")
+            comparison_caption = (
+                "행은 조회 항목, 열은 그룹·함량별 의약품입니다. 신청의약품은 맨 오른쪽에 표시됩니다."
+                if group_mode else "행은 조회 항목, 열은 선택한 의약품입니다."
+            )
+            st.caption(f"{comparison_caption} 헤더 경계를 드래그해 컬럼 너비를 조절할 수 있습니다.")
             render_resizable_wrapped_table(comparison_df, show_index=True, height=760, table_key="comparison")
             comparison_csv = comparison_df.to_csv(index=True, encoding="utf-8-sig").encode("utf-8-sig")
             st.download_button("비교표 CSV 다운로드", data=comparison_csv, file_name=f"의약품비교표_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
-
-    with dur_tab:
-        if not st.session_state.dur_indices:
-            st.info("사이드바의 'DUR 품목리스트 업로드'에서 먼저 엑셀을 올려주세요.")
-        else:
-            if st.button("선택한 품목 DUR 확인", key="run_dur_check"):
-                dur_call_counter = {"hira": 0, "mfds": 0}
-                dur_errors = []
-                dur_cache_detail = load_json_cache(CACHE_DETAIL_FILE)
-                with st.spinner("DUR(병용금기 등) 확인 중입니다…"):
-                    dur_result_df = check_dur(
-                        selected_rows, mfds_key, st.session_state.dur_indices,
-                        dur_cache_detail, dur_call_counter, dur_errors,
-                    )
-                save_json_cache(CACHE_DETAIL_FILE, dur_cache_detail)
-                st.session_state.dur_result = dur_result_df
-                st.session_state.dur_errors = dur_errors
-
-            if "dur_result" in st.session_state:
-                dur_result_df = st.session_state.dur_result
-                if dur_result_df.empty:
-                    st.success("선택한 품목 중 업로드된 DUR 리스트에 해당하는 품목이 없습니다.")
-                else:
-                    st.dataframe(dur_result_df, use_container_width=True, hide_index=True)
-                    dur_csv = dur_result_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-                    st.download_button(
-                        "DUR 확인 결과 CSV 다운로드", data=dur_csv,
-                        file_name=f"DUR확인결과_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv",
-                    )
-                if st.session_state.get("dur_errors"):
-                    with st.expander(f"DUR 확인 중 경고/오류 {len(st.session_state.dur_errors)}건"):
-                        for error in st.session_state.dur_errors:
-                            st.warning(error)
 
     if st.session_state.last_errors:
         with st.expander(f"API 경고/오류 {len(st.session_state.last_errors)}건"):
