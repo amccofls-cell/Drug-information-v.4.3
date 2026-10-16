@@ -1274,6 +1274,13 @@ st.markdown(
         font-size: 1rem;
         line-height: 1.65;
     }
+    .app-hero .app-credit {
+        margin-top: .9rem;
+        text-align: right;
+        color: var(--muted);
+        font-size: .78rem;
+        line-height: 1.5;
+    }
     .section-title {
         display: flex;
         align-items: center;
@@ -1455,6 +1462,7 @@ st.markdown(
       <span class="hero-kicker">OFFICIAL DRUG REFERENCE</span>
       <h1>의약품 허가정보·약가 통합 조회</h1>
       <p>식약처 허가사항과 심평원 급여약가를 한 화면에서 조회하고, 비교표와 AI 검토용 공식 레퍼런스를 생성합니다.</p>
+      <div class="app-credit" lang="en">Developed by Chaereen Jeong</div>
     </div>
     """,
     unsafe_allow_html=True,
