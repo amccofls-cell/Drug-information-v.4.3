@@ -216,19 +216,49 @@ def add_to_selection(group_mode, target_gid, seqs):
         selection.extend(seq for seq in seqs if seq not in selection)
 
 
-def move_selection(seq, delta):
-    """조회할 품목 목록에서 seq 품목을 delta(-1: 위, +1: 아래)만큼 이동합니다."""
+def reset_sel_editor():
+    """조회할 품목 표의 위젯 상태(체크 변경분)를 초기화합니다."""
+    st.session_state.sel_editor_ver = st.session_state.get("sel_editor_ver", 0) + 1
+
+
+def effective_checked():
+    """표에서 현재 체크된 품목코드 집합(렌더 시점의 기준값 + 사용자가 바꾼 체크)을 계산합니다."""
     selection = st.session_state.selection
-    if seq not in selection:
-        return
-    i = selection.index(seq)
-    j = i + delta
-    if 0 <= j < len(selection):
-        selection[i], selection[j] = selection[j], selection[i]
+    checked = set(st.session_state.get("sel_checked", set())) & set(selection)
+    state = st.session_state.get(f"sel_editor_{st.session_state.get('sel_editor_ver', 0)}")
+    edited_rows = state.get("edited_rows", {}) if isinstance(state, dict) else {}
+    for idx, changes in edited_rows.items():
+        idx = int(idx)
+        if "선택" in changes and 0 <= idx < len(selection):
+            if changes["선택"]:
+                checked.add(selection[idx])
+            else:
+                checked.discard(selection[idx])
+    return checked
 
 
-def remove_selection(seq):
-    st.session_state.selection = [s for s in st.session_state.selection if s != seq]
+def move_checked(delta):
+    """체크된 품목들을 한 칸 위(-1) 또는 아래(+1)로 이동합니다. 체크 상태는 이동한 품목을 따라갑니다."""
+    selection = st.session_state.selection
+    checked = effective_checked()
+    n = len(selection)
+    if delta < 0:
+        for i in range(1, n):
+            if selection[i] in checked and selection[i - 1] not in checked:
+                selection[i - 1], selection[i] = selection[i], selection[i - 1]
+    else:
+        for i in range(n - 2, -1, -1):
+            if selection[i] in checked and selection[i + 1] not in checked:
+                selection[i + 1], selection[i] = selection[i], selection[i + 1]
+    st.session_state.sel_checked = checked
+    reset_sel_editor()
+
+
+def remove_checked():
+    checked = effective_checked()
+    st.session_state.selection = [s for s in st.session_state.selection if s not in checked]
+    st.session_state.sel_checked = set()
+    reset_sel_editor()
 
 
 def build_group_items(by_seq):
@@ -1598,6 +1628,8 @@ st.success(f"정상 품목 {len(normal_rows):,}건 준비 완료")
 
 if "selection" not in st.session_state:
     st.session_state.selection = []
+st.session_state.setdefault("sel_checked", set())
+st.session_state.setdefault("sel_editor_ver", 0)
 ensure_group_state()
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
@@ -1625,6 +1657,8 @@ if group_mode and not previous_group_mode:
     )
 elif not group_mode and previous_group_mode:
     st.session_state.selection = list(dict.fromkeys(flatten_group_seqs()))
+    st.session_state.sel_checked = set()
+    reset_sel_editor()
 st.session_state.group_mode_previous = group_mode
 
 query = st.text_input(
@@ -1748,25 +1782,40 @@ if group_mode:
 else:
     section_header("2", "조회할 품목")
     # by_seq에 없는 코드는 정리해 둡니다(화면 순서와 내부 순서가 어긋나지 않도록).
-    st.session_state.selection = [s for s in st.session_state.selection if s in by_seq]
+    cleaned_selection = [s for s in st.session_state.selection if s in by_seq]
+    if len(cleaned_selection) != len(st.session_state.selection):
+        st.session_state.selection = cleaned_selection
+        reset_sel_editor()
     selected_seqs = list(st.session_state.selection)
     if selected_seqs:
-        st.caption("↑ ↓ 버튼으로 조회·결과 표에 나올 순서를 바꿀 수 있고, ✕ 버튼으로 제거합니다.")
-        widths = [0.6, 5, 3, 0.8, 0.8, 0.8]
-        for col, title in zip(st.columns(widths), ["순서", "의약품명", "제약사", "", "", ""]):
-            col.markdown(f"**{title}**")
-        for pos, seq in enumerate(selected_seqs):
-            row = by_seq[seq]
-            c = st.columns(widths, vertical_alignment="center")
-            c[0].write(pos + 1)
-            c[1].write(row.get("ITEM_NAME", ""))
-            c[2].write(row.get("ENTP_NAME", ""))
-            c[3].button("↑", key=f"up_{seq}", disabled=(pos == 0),
-                        on_click=move_selection, args=(seq, -1), use_container_width=True)
-            c[4].button("↓", key=f"down_{seq}", disabled=(pos == len(selected_seqs) - 1),
-                        on_click=move_selection, args=(seq, 1), use_container_width=True)
-            c[5].button("✕", key=f"del_{seq}",
-                        on_click=remove_selection, args=(seq,), use_container_width=True)
+        checked_base = st.session_state.sel_checked
+        selected_df = pd.DataFrame([
+            {
+                "선택": seq in checked_base,
+                "의약품명": by_seq[seq].get("ITEM_NAME", ""),
+                "제약사": by_seq[seq].get("ENTP_NAME", ""),
+                "품목코드": seq,
+            }
+            for seq in selected_seqs
+        ])
+        table_col, arrow_col = st.columns([12, 1])
+        with table_col:
+            edited_sel_df = st.data_editor(
+                selected_df, use_container_width=True, hide_index=True,
+                disabled=["의약품명", "제약사", "품목코드"],
+                column_config={"선택": st.column_config.CheckboxColumn("선택", width="small")},
+                key=f"sel_editor_{st.session_state.sel_editor_ver}",
+            )
+        has_checked = bool(edited_sel_df["선택"].any())
+        with arrow_col:
+            st.button("↑", key="sel_move_up", disabled=not has_checked,
+                      on_click=move_checked, args=(-1,), use_container_width=True,
+                      help="체크한 품목을 한 칸 위로")
+            st.button("↓", key="sel_move_down", disabled=not has_checked,
+                      on_click=move_checked, args=(1,), use_container_width=True,
+                      help="체크한 품목을 한 칸 아래로")
+        st.button("선택한 품목 제거", disabled=not has_checked, key="remove_selected_items",
+                  on_click=remove_checked)
     else:
         st.info("검색 결과에서 조회할 품목을 추가하세요.")
     st.write(f"현재 선택: **총 {len(selected_seqs)}개 품목**")
