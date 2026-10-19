@@ -81,7 +81,7 @@ NEW_DRUG_PRESET_KEYS = [
     "유효기간", "성상", "전문일반구분", "보관정보", "보관_취급주의사항",
 ]
 ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명", "희귀의약품"]
-RESULT_COLUMN_ORDER = ["구분", "함량", "허가제품명", "제약사한글명", "희귀의약품", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
+RESULT_COLUMN_ORDER = ["구분", "함량", "허가제품명", "제약사한글명", "희귀의약품", "약가", "예정약가(기준일 이후)", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
 MAX_RETRY = 5
 MFDS_RAW_EXCLUDED_FIELDS = {
@@ -433,7 +433,7 @@ def make_summary_df(result_df):
     if "용법용량" in summary_df.columns:
         summary_df["용법용량"] = summary_df["용법용량"].map(lambda value: summarize_usage(value))
     for column in summary_df.columns:
-        if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "약가", "약효분류", "주성분영문명", "영문제품명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보"}:
+        if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "약가", "예정약가(기준일 이후)", "심평원제품코드", "약가적용시작일", "판매예정종료일", "약효분류", "주성분영문명", "영문제품명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보"}:
             summary_df[column] = summary_df[column].map(lambda value: summarize_text(value, max_chars=260, max_sentences=2))
     return summary_df
 
@@ -745,8 +745,40 @@ def hira_package_hint(item):
     return " ".join(parts)
 
 
-def effective_items_by_code(items, as_of_date):
-    """제품코드(mdsCd)별로 기준일에 유효한 약가 이력 1건씩을 골라 코드순으로 반환합니다."""
+def parse_price_int(value):
+    digits = re.sub(r"[^\d]", "", str(value or ""))
+    return int(digits) if digits else None
+
+
+def upcoming_hira_changes(items, as_of_date):
+    """기준일 이후에 적용 시작되는 약가 이력(인하·인상·급여삭제 포함)을 적용일 순으로 반환합니다."""
+    rows, seen = [], set()
+    for item in items:
+        start = parse_hira_date(item.get("adtStaDd"))
+        if start is None or start <= as_of_date:
+            continue
+        deleted = (
+            clean_whitespace(item.get("payTpNm", "")).lower() in {"삭제", "deleted"}
+            or clean_whitespace(item.get("delYn", "")).lower() == "y"
+        )
+        key = (start, clean_whitespace(item.get("mxCprc", "")), deleted)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "adtStaDd": start.strftime("%Y%m%d"),
+            "mxCprc": clean_whitespace(item.get("mxCprc", "")),
+            "payTpNm": clean_whitespace(item.get("payTpNm", "")),
+            "deleted": deleted,
+        })
+    rows.sort(key=lambda row: row["adtStaDd"])
+    return rows
+
+
+def effective_items_by_code(items, as_of_date, include_pending=False):
+    """제품코드(mdsCd)별로 기준일에 유효한 약가 이력 1건씩을 골라 코드순으로 반환합니다.
+    각 항목의 '_upcoming'에는 기준일 이후 적용 예정 이력이 들어갑니다.
+    include_pending=True이면 기준일 현재는 급여가 없지만 이후 등재 예정인 코드도 '_pending' 항목으로 포함합니다."""
     groups = {}
     for item in items:
         code = hira_code(item)
@@ -754,9 +786,19 @@ def effective_items_by_code(items, as_of_date):
             groups.setdefault(code, []).append(item)
     picked = []
     for code in sorted(groups):
-        selected = select_effective_hira_item(groups[code], as_of_date)
+        group = groups[code]
+        selected = select_effective_hira_item(group, as_of_date)
+        upcoming = upcoming_hira_changes(group, as_of_date)
         if selected:
+            selected = dict(selected)
+            selected["_upcoming"] = upcoming
             picked.append(selected)
+        elif include_pending and upcoming:
+            picked.append({
+                "mdsCd": group[0].get("mdsCd", ""), "itmNm": group[0].get("itmNm", ""),
+                "mxCprc": "", "adtStaDd": "", "sellEptDd": "",
+                "_pending": True, "_upcoming": upcoming,
+            })
     return picked
 
 
@@ -773,7 +815,7 @@ def match_prices(item_name, bar_code, service_key, call_counter, cache_code, cac
 
     found, all_cached = [], True
     for key8 in keys8:
-        cache_key = f"{key8}|{as_of_key}|all"
+        cache_key = f"{key8}|{as_of_key}|all2"
         cached = cache_code.get(cache_key)
         if isinstance(cached, list):
             found.extend(cached)
@@ -788,7 +830,7 @@ def match_prices(item_name, bar_code, service_key, call_counter, cache_code, cac
             errors.append(f"HIRA mdsCd={key8}: {exc}")
             continue
         exact = [it for it in items if mdscd_key8(it.get("mdsCd")) == key8]
-        picked = effective_items_by_code(exact, as_of_date)
+        picked = effective_items_by_code(exact, as_of_date, include_pending=True)
         if picked:
             cache_code[cache_key] = picked
         found.extend(picked)
@@ -796,7 +838,7 @@ def match_prices(item_name, bar_code, service_key, call_counter, cache_code, cac
     # 8자리 조회로 하나도 못 찾았을 때만, 바코드에서 얻은 9자리 코드로 정확 조회를 시도합니다.
     if not found:
         for code9 in codes9:
-            cache_key = f"{code9}|{as_of_key}|code9"
+            cache_key = f"{code9}|{as_of_key}|code9v2"
             cached = cache_code.get(cache_key)
             if isinstance(cached, list):
                 found.extend(cached)
@@ -811,7 +853,7 @@ def match_prices(item_name, bar_code, service_key, call_counter, cache_code, cac
                 errors.append(f"HIRA mdsCd={code9}: {exc}")
                 continue
             exact = [it for it in items if hira_code(it) == code9]
-            picked = effective_items_by_code(exact, as_of_date)
+            picked = effective_items_by_code(exact, as_of_date, include_pending=True)
             cache_code[cache_key] = picked
             found.extend(picked)
 
@@ -824,7 +866,7 @@ def match_prices(item_name, bar_code, service_key, call_counter, cache_code, cac
         return prices, method
 
     name_key = re.sub(r"_\(.*?\)\s*$", "", item_name or "").strip()
-    name_cache_key = f"{name_key}|{as_of_key}|all"
+    name_cache_key = f"{name_key}|{as_of_key}|all2"
     cached = cache_name.get(name_cache_key)
     if isinstance(cached, list):
         prices = cached
@@ -878,12 +920,39 @@ def format_price_cell(price_items):
     """약가 1건이면 기존과 같은 '1,309원', 여러 건이면 포장(제품코드)별로 줄을 나눠 모두 표시합니다."""
     if not price_items:
         return ""
+    def price_text(item):
+        if item.get("_pending"):
+            return "기준일 현재 급여 미적용"
+        return format_price(item.get("mxCprc", ""))
+
     if len(price_items) == 1:
-        return format_price(price_items[0].get("mxCprc", ""))
-    return "\n".join(
-        f"{price_line_label(item, price_items)}: {format_price(item.get('mxCprc', ''))}"
-        for item in price_items
-    )
+        return price_text(price_items[0])
+    return "\n".join(f"{price_line_label(item, price_items)}: {price_text(item)}" for item in price_items)
+
+
+def format_upcoming_cell(price_items):
+    """기준일 이후 적용 예정 약가(인하·인상·급여삭제)를 적용일과 변동률로 표시합니다."""
+    if not price_items:
+        return ""
+    multi = len(price_items) > 1
+    lines = []
+    for item in price_items:
+        previous = parse_price_int(item.get("mxCprc"))
+        for change in item.get("_upcoming", []):
+            day = change["adtStaDd"]
+            day_text = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+            if change["deleted"]:
+                text = "급여 삭제"
+            else:
+                new_price = parse_price_int(change["mxCprc"])
+                text = format_price(change["mxCprc"])
+                if previous and new_price:
+                    text += f" ({(new_price - previous) / previous * 100:+.1f}%)"
+                if new_price:
+                    previous = new_price
+            prefix = f"{hira_code(item)} " if multi else ""
+            lines.append(f"{prefix}{day_text}~: {text}")
+    return "\n".join(lines) if lines else "확인된 예정 약가 없음"
 
 
 def join_hira_field(price_items, key):
@@ -1308,7 +1377,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
         )
         price_item = price_items[0] if price_items else None
         effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
-        out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "희귀의약품": detail.get("희귀의약품", ""), "약가": format_price_cell(price_items), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": join_hira_field(price_items, "mdsCd"), "약가적용시작일": join_hira_field(price_items, "adtStaDd"), "판매예정종료일": join_hira_field(price_items, "sellEptDd"), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
+        out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "희귀의약품": detail.get("희귀의약품", ""), "약가": format_price_cell(price_items), "예정약가(기준일 이후)": format_upcoming_cell(price_items), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": join_hira_field(price_items, "mdsCd"), "약가적용시작일": join_hira_field(price_items, "adtStaDd"), "판매예정종료일": join_hira_field(price_items, "sellEptDd"), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
         if include_all_fields:
@@ -1352,7 +1421,17 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
                     "max_price": item.get("mxCprc"),
                     "effective_start": clean_whitespace(item.get("adtStaDd", "")),
                     "sale_end": clean_whitespace(item.get("sellEptDd", "")),
-                    "raw": item,
+                    "pending_listing": bool(item.get("_pending")),
+                    "upcoming_changes": [
+                        {
+                            "effective_start": change["adtStaDd"],
+                            "max_price": change["mxCprc"],
+                            "pay_type": change["payTpNm"],
+                            "deleted": change["deleted"],
+                        }
+                        for change in item.get("_upcoming", [])
+                    ],
+                    "raw": {key: value for key, value in item.items() if not str(key).startswith("_")},
                 }
                 for item in price_items
             ],
@@ -1364,7 +1443,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
     save_json_cache(CACHE_DETAIL_FILE, cache_detail)
     save_json_cache(CACHE_MEFT_FILE, cache_meft)
     reference_bundle = {
-        "schema_version": "1.2",
+        "schema_version": "1.3",
         "reference_date": as_of_date.isoformat(),
         "generated_at": datetime.now(KST).isoformat(timespec="seconds"),
         "product_count": len(reference_items),
@@ -2008,6 +2087,8 @@ price_reference_date = st.date_input(
     value=datetime.now(KST).date(),
     help="이 날짜에 적용 중인 약가 이력만 선택합니다. 적용 시작일과 판매 종료일을 함께 판정합니다.",
 )
+
+st.caption("약가 기준일 이후에 적용될 예정 약가(인하·인상·급여삭제)는 조회 결과의 '예정약가(기준일 이후)' 행에 따로 표시됩니다.")
 
 applicant_ready = not group_mode or bool(st.session_state.groups["applicant"]["seqs"])
 if group_mode and not applicant_ready and selected_seqs:
