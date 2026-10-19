@@ -724,6 +724,173 @@ def match_price(item_name, bar_code, service_key, call_counter, cache_code, cach
     return "", "기준일 유효 약가 매칭없음", None
 
 
+HIRA_PACK_FIELD_HINTS = ("unit", "pack", "pkg", "spec")
+
+
+def hira_code(item):
+    """심평원 약제 코드(mdsCd, 보통 9자리)를 숫자 문자열로 반환합니다."""
+    return normalize_code_digits((item or {}).get("mdsCd"))
+
+
+def hira_package_hint(item):
+    """심평원 응답 필드 중 이름에 unit/pack/pkg/spec이 들어간 값을 포장·규격 힌트로 모읍니다."""
+    parts = []
+    for key, value in (item or {}).items():
+        lowered = str(key).lower()
+        if lowered == "mdscd" or not any(hint in lowered for hint in HIRA_PACK_FIELD_HINTS):
+            continue
+        text = clean_whitespace(value)
+        if text and text not in parts:
+            parts.append(text)
+    return " ".join(parts)
+
+
+def effective_items_by_code(items, as_of_date):
+    """제품코드(mdsCd)별로 기준일에 유효한 약가 이력 1건씩을 골라 코드순으로 반환합니다."""
+    groups = {}
+    for item in items:
+        code = hira_code(item)
+        if code:
+            groups.setdefault(code, []).append(item)
+    picked = []
+    for code in sorted(groups):
+        selected = select_effective_hira_item(groups[code], as_of_date)
+        if selected:
+            picked.append(selected)
+    return picked
+
+
+def match_prices(item_name, bar_code, service_key, call_counter, cache_code, cache_name, errors, as_of_date):
+    """식약처 품목 1개에 연결된 심평원 약가를 포장(제품코드)별로 모두 찾습니다.
+    반환: (약가 항목 리스트, 매칭근거 문자열). 항목이 1개면 기존과 같은 결과입니다."""
+    as_of_key = as_of_date.isoformat()
+    keys8, codes9 = [], []
+    for barcode in split_barcode_values(bar_code):
+        if len(barcode) >= 11 and barcode[3:11] not in keys8:
+            keys8.append(barcode[3:11])
+        if len(barcode) >= 12 and barcode[3:12] not in codes9:
+            codes9.append(barcode[3:12])
+
+    found, all_cached = [], True
+    for key8 in keys8:
+        cache_key = f"{key8}|{as_of_key}|all"
+        cached = cache_code.get(cache_key)
+        if isinstance(cached, list):
+            found.extend(cached)
+            continue
+        if call_counter["hira"] >= HIRA_CALL_LIMIT:
+            continue
+        call_counter["hira"] += 1
+        all_cached = False
+        try:
+            items = hira_get(service_key, {"mdsCd": key8})
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(f"HIRA mdsCd={key8}: {exc}")
+            continue
+        exact = [it for it in items if mdscd_key8(it.get("mdsCd")) == key8]
+        picked = effective_items_by_code(exact, as_of_date)
+        if picked:
+            cache_code[cache_key] = picked
+        found.extend(picked)
+
+    # 8자리 조회로 하나도 못 찾았을 때만, 바코드에서 얻은 9자리 코드로 정확 조회를 시도합니다.
+    if not found:
+        for code9 in codes9:
+            cache_key = f"{code9}|{as_of_key}|code9"
+            cached = cache_code.get(cache_key)
+            if isinstance(cached, list):
+                found.extend(cached)
+                continue
+            if call_counter["hira"] >= HIRA_CALL_LIMIT:
+                continue
+            call_counter["hira"] += 1
+            all_cached = False
+            try:
+                items = hira_get(service_key, {"mdsCd": code9})
+            except (requests.RequestException, ValueError) as exc:
+                errors.append(f"HIRA mdsCd={code9}: {exc}")
+                continue
+            exact = [it for it in items if hira_code(it) == code9]
+            picked = effective_items_by_code(exact, as_of_date)
+            cache_code[cache_key] = picked
+            found.extend(picked)
+
+    if found:
+        unique = {hira_code(it): it for it in found}
+        prices = [unique[code] for code in sorted(unique)]
+        method = "bar_code_8자리(기준일 캐시)" if all_cached else "bar_code_8자리(기준일 직접조회)"
+        if len(prices) > 1:
+            method += f", 포장별 {len(prices)}건"
+        return prices, method
+
+    name_key = re.sub(r"_\(.*?\)\s*$", "", item_name or "").strip()
+    name_cache_key = f"{name_key}|{as_of_key}|all"
+    cached = cache_name.get(name_cache_key)
+    if isinstance(cached, list):
+        prices = cached
+    else:
+        if call_counter["hira"] >= HIRA_CALL_LIMIT:
+            return [], "호출한도초과"
+        call_counter["hira"] += 1
+        call_ok = True
+        try:
+            items = hira_get(service_key, {"itmNm": name_key})
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(f"HIRA itmNm={name_key}: {exc}")
+            items, call_ok = [], False
+        valid = [it for it in items if it.get("payTpNm") != "삭제"]
+        prices = []
+        for key8 in keys8:
+            exact = [it for it in valid if mdscd_key8(it.get("mdsCd")) == key8]
+            prices = effective_items_by_code(exact, as_of_date)
+            if prices:
+                break
+        if not prices:
+            def norm(name):
+                return re.sub(r"_\(.*?\)\s*$", "", name or "").strip()
+            exact_name = [it for it in valid if norm(it.get("itmNm")) == name_key]
+            prices = effective_items_by_code(exact_name, as_of_date)
+        if call_ok:
+            cache_name[name_cache_key] = prices
+    if prices:
+        method = "품목명검색(8자리검증 또는 완전일치, 기준일 적용)"
+        if len(prices) > 1:
+            method += f", 포장별 {len(prices)}건"
+        return prices, method
+    return [], "기준일 유효 약가 매칭없음"
+
+
+def price_line_label(item, all_items):
+    """약가 한 줄 앞에 붙일 라벨: 제품코드 + (포장·규격 힌트)."""
+    code = hira_code(item)
+    hint = hira_package_hint(item)
+    names = {clean_whitespace(it.get("itmNm", "")) for it in all_items}
+    if len(names) > 1:
+        name = clean_whitespace(item.get("itmNm", ""))
+        suffix = re.search(r"_\((.*?)\)\s*$", name)
+        extra = suffix.group(1) if suffix else name
+        if extra and extra not in hint:
+            hint = f"{hint} {extra}".strip()
+    return f"{code} ({hint})" if hint else code
+
+
+def format_price_cell(price_items):
+    """약가 1건이면 기존과 같은 '1,309원', 여러 건이면 포장(제품코드)별로 줄을 나눠 모두 표시합니다."""
+    if not price_items:
+        return ""
+    if len(price_items) == 1:
+        return format_price(price_items[0].get("mxCprc", ""))
+    return "\n".join(
+        f"{price_line_label(item, price_items)}: {format_price(item.get('mxCprc', ''))}"
+        for item in price_items
+    )
+
+
+def join_hira_field(price_items, key):
+    """약가가 여러 건이면 약가 칸과 같은 순서로 줄바꿈해 이어 붙입니다."""
+    return "\n".join(clean_whitespace(item.get(key, "")) for item in price_items)
+
+
 def get_effect_classification(item_name, bar_code, service_key, call_counter, cache_meft, errors):
     """심평원 응답의 meftDivNo를 항상 조회해 약효분류로 반환합니다."""
     key8 = barcode_key8(bar_code)
@@ -1001,7 +1168,7 @@ def render_resizable_wrapped_table(display_df, show_index=False, height=720, tab
     def cell(value):
         if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
             value = ""
-        return html_lib.escape(str(value)).replace("\\n", "<br>")
+        return html_lib.escape(str(value)).replace("\\n", "<br>").replace("\n", "<br>")
 
     if show_index:
         # 행/열 전환 보기: 약 하나가 세로줄 하나가 됩니다. 맨 앞(항목명) 열만 고정 폭으로 두고,
@@ -1136,11 +1303,12 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
             include_all_fields=include_all_fields,
         )
         bar_code = detail.get("_bar_code", "")
-        price, method, price_item = match_price(
+        price_items, method = match_prices(
             item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors, as_of_date
         )
+        price_item = price_items[0] if price_items else None
         effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
-        out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "희귀의약품": detail.get("희귀의약품", ""), "약가": format_price(price), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": clean_whitespace((price_item or {}).get("mdsCd", "")), "약가적용시작일": clean_whitespace((price_item or {}).get("adtStaDd", "")), "판매예정종료일": clean_whitespace((price_item or {}).get("sellEptDd", "")), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
+        out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "희귀의약품": detail.get("희귀의약품", ""), "약가": format_price_cell(price_items), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": join_hira_field(price_items, "mdsCd"), "약가적용시작일": join_hira_field(price_items, "adtStaDd"), "판매예정종료일": join_hira_field(price_items, "sellEptDd"), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
         if include_all_fields:
@@ -1176,6 +1344,18 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
                 "effective_start": clean_whitespace((price_item or {}).get("adtStaDd", "")),
                 "sale_end": clean_whitespace((price_item or {}).get("sellEptDd", "")),
             } if price_item else None,
+            "hira_prices": [
+                {
+                    "mds_cd": clean_whitespace(item.get("mdsCd", "")),
+                    "product_name": clean_whitespace(item.get("itmNm", "")),
+                    "package_hint": hira_package_hint(item),
+                    "max_price": item.get("mxCprc"),
+                    "effective_start": clean_whitespace(item.get("adtStaDd", "")),
+                    "sale_end": clean_whitespace(item.get("sellEptDd", "")),
+                    "raw": item,
+                }
+                for item in price_items
+            ],
         })
         progress.progress(index / len(rows), text=f"조회 중: {index}/{len(rows)}")
     progress.empty()
@@ -1184,7 +1364,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
     save_json_cache(CACHE_DETAIL_FILE, cache_detail)
     save_json_cache(CACHE_MEFT_FILE, cache_meft)
     reference_bundle = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "reference_date": as_of_date.isoformat(),
         "generated_at": datetime.now(KST).isoformat(timespec="seconds"),
         "product_count": len(reference_items),
@@ -1883,6 +2063,16 @@ if st.session_state.last_result is not None:
                 mime="application/json",
                 help="비교표 또는 PPT와 함께 Work에 올려 사실관계 검토에 사용합니다.",
             )
+            priced_products = [
+                product for product in st.session_state.last_reference_json.get("products", [])
+                if product.get("hira_prices")
+            ]
+            if priced_products:
+                with st.expander("심평원 약가 원본 필드 확인 (포장정보 필드 점검용)"):
+                    st.caption("품목별로 심평원 API가 돌려준 약가 항목의 원본 필드입니다. 포장·규격이 어느 필드에 있는지 확인할 때 사용하세요.")
+                    for product in priced_products[:5]:
+                        st.markdown(f"**{product['mfds']['product_name']}** · 약가 {len(product['hira_prices'])}건")
+                        st.json([price["raw"] for price in product["hira_prices"]], expanded=False)
 
     with comparison_tab:
         if len(filtered_result_df) < 2:
