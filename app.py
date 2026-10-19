@@ -206,6 +206,39 @@ def remove_group_seqs(group_id, seqs):
     sync_selection_from_groups()
 
 
+# ── 콜백 함수 (버튼 on_click용: 콜백은 스크립트 재실행 전에 실행되므로 st.rerun()이 필요 없습니다) ──
+def add_to_selection(group_mode, target_gid, seqs):
+    """검색 결과에서 선택한 품목을 조회 목록(또는 그룹)에 추가합니다."""
+    if group_mode:
+        assign_seqs_to_group(target_gid, seqs)
+    else:
+        selection = st.session_state.selection
+        selection.extend(seq for seq in seqs if seq not in selection)
+
+
+def move_selected_items(delta):
+    """'조회할 품목' 표에서 선택(체크)한 행들을 한 칸 위(-1) 또는 아래(+1)로 이동합니다."""
+    rendered = st.session_state.get("sel_rendered", [])
+    state = st.session_state.get(f"selected_items_table_{st.session_state.get('sel_table_ver', 0)}")
+    try:
+        rows = list(state["selection"]["rows"]) if state else []
+    except (KeyError, TypeError):
+        rows = []
+    checked = {rendered[i] for i in rows if 0 <= i < len(rendered)}
+    selection = st.session_state.selection
+    n = len(selection)
+    if delta < 0:
+        for i in range(1, n):
+            if selection[i] in checked and selection[i - 1] not in checked:
+                selection[i - 1], selection[i] = selection[i], selection[i - 1]
+    else:
+        for i in range(n - 2, -1, -1):
+            if selection[i] in checked and selection[i + 1] not in checked:
+                selection[i + 1], selection[i] = selection[i], selection[i + 1]
+    # 순서가 바뀌면 행 번호 기준 선택이 어긋나므로, 표 위젯을 새로 만들어 선택을 초기화합니다.
+    st.session_state.sel_table_ver = st.session_state.get("sel_table_ver", 0) + 1
+
+
 def build_group_items(by_seq):
     items = []
     for gid in ordered_group_ids(st.session_state.groups):
@@ -802,7 +835,10 @@ def fetch_list_page(page, mfds_key):
     raise last_err
 
 
-@st.cache_data(show_spinner=False)
+# cache_data → cache_resource: cache_data는 호출할 때마다 수만 건 목록을 복사(역직렬화)하지만,
+# cache_resource는 같은 객체를 그대로 돌려주므로 매 재실행마다 드는 비용이 거의 없습니다.
+# (반환된 목록은 읽기 전용으로만 사용하세요.)
+@st.cache_resource(show_spinner=False)
 def load_permitted_drugs(mfds_key, data_dir_string, cache_day, force_refresh_token=0):
     list_file = Path(data_dir_string) / "허가목록_원본.csv"
     temp_file = Path(data_dir_string) / "허가목록_임시.json"
@@ -862,6 +898,30 @@ def load_permitted_drugs(mfds_key, data_dir_string, cache_day, force_refresh_tok
     with meta_file.open("w", encoding="utf-8") as file:
         json.dump({"collected_date_kst": cache_day, "updated_at": datetime.now(KST).isoformat()}, file, ensure_ascii=False, indent=2)
     return all_rows
+
+
+def detail_cache_mtime():
+    return CACHE_DETAIL_FILE.stat().st_mtime if CACHE_DETAIL_FILE.exists() else 0
+
+
+@st.cache_resource(show_spinner=False)
+def build_search_index(_normal_rows, cache_day, row_count, detail_mtime):
+    """검색용 소문자 문자열과 성분명 경량 캐시를 한 번만 만들어 재사용합니다.
+    상세 조회를 하면 캐시 파일 수정시간(detail_mtime)이 바뀌어 인덱스가 한 번 다시 만들어집니다."""
+    detail = load_json_cache(CACHE_DETAIL_FILE)
+    index, light = [], {}
+    for row in _normal_rows:
+        seq = str(row.get("ITEM_SEQ", ""))
+        d = detail.get(seq, {})
+        ingr, ingr_eng = d.get("성분명", ""), d.get("주성분영문명", "")
+        blob = " ".join(str(v) for v in [
+            row.get("ITEM_NAME", ""), row.get("ENTP_NAME", ""),
+            row.get("MAIN_ITEM_INGR", ""), row.get("MAIN_INGR_ENG", ""),
+            ingr, ingr_eng,
+        ]).casefold()
+        index.append((blob, row))
+        light[seq] = (ingr, ingr_eng)
+    return index, light
 
 
 def order_result_columns(df):
@@ -1512,6 +1572,7 @@ with st.sidebar:
 
     if st.button("허가목록 캐시 새로고침"):
         st.cache_data.clear()
+        st.cache_resource.clear()
         for cache_path in (LIST_FILE, LIST_META_FILE, TEMP_FILE):
             if cache_path.exists():
                 cache_path.unlink()
@@ -1538,11 +1599,14 @@ except Exception as exc:
 
 normal_rows = [row for row in all_rows if row.get("CANCEL_NAME") == "정상"]
 by_seq = {row.get("ITEM_SEQ", ""): row for row in normal_rows}
-search_detail_cache = load_json_cache(CACHE_DETAIL_FILE)
+search_index, search_light = build_search_index(
+    normal_rows, cache_day, len(normal_rows), detail_cache_mtime()
+)
 st.success(f"정상 품목 {len(normal_rows):,}건 준비 완료")
 
 if "selection" not in st.session_state:
     st.session_state.selection = []
+st.session_state.setdefault("sel_table_ver", 0)
 ensure_group_state()
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
@@ -1598,15 +1662,8 @@ if group_mode:
 matches = []
 if query.strip():
     q = query.strip().casefold()
-    matches = []
-    for row in normal_rows:
-        cached_detail = search_detail_cache.get(str(row.get("ITEM_SEQ", "")), {})
-        searchable_values = [
-            row.get("ITEM_NAME", ""), row.get("ENTP_NAME", ""),
-            row.get("MAIN_ITEM_INGR", ""), row.get("MAIN_INGR_ENG", ""),
-            cached_detail.get("성분명", ""), cached_detail.get("주성분영문명", ""),
-        ]
-        if any(q in str(value).casefold() for value in searchable_values):
+    for blob, row in search_index:
+        if q in blob:
             matches.append(row)
             if len(matches) >= 200:
                 break
@@ -1618,8 +1675,8 @@ if matches:
         {
             "의약품명": row.get("ITEM_NAME", ""),
             "제약사": row.get("ENTP_NAME", ""),
-            "성분명": clean_ingredient(row.get("MAIN_ITEM_INGR", "")) or search_detail_cache.get(str(row.get("ITEM_SEQ", "")), {}).get("성분명", ""),
-            "주성분 영문명": row.get("MAIN_INGR_ENG", "") or search_detail_cache.get(str(row.get("ITEM_SEQ", "")), {}).get("주성분영문명", ""),
+            "성분명": clean_ingredient(row.get("MAIN_ITEM_INGR", "")) or search_light.get(str(row.get("ITEM_SEQ", "")), ("", ""))[0],
+            "주성분 영문명": row.get("MAIN_INGR_ENG", "") or search_light.get(str(row.get("ITEM_SEQ", "")), ("", ""))[1],
             "품목코드": row.get("ITEM_SEQ", ""),
         }
         for row in matches
@@ -1645,14 +1702,11 @@ if matches:
         f"선택한 품목을 {st.session_state.groups[target_group_id]['label']}에 추가"
         if group_mode else "선택한 품목을 조회 목록에 추가"
     )
-    if st.button(add_label, disabled=not search_selected_seqs, key="add_search_selection"):
-        if group_mode:
-            assign_seqs_to_group(target_group_id, search_selected_seqs)
-        else:
-            st.session_state.selection.extend(
-                seq for seq in search_selected_seqs if seq not in st.session_state.selection
-            )
-        st.rerun()
+    # on_click 콜백: 버튼 클릭 → 콜백 실행 → 스크립트 1회 재실행 (기존의 st.rerun() 추가 재실행 제거)
+    st.button(
+        add_label, disabled=not search_selected_seqs, key="add_search_selection",
+        on_click=add_to_selection, args=(group_mode, target_group_id, search_selected_seqs),
+    )
 
 if group_mode:
     section_header("2", "신청의약품 · 비교의약품 그룹")
@@ -1703,19 +1757,30 @@ if group_mode:
 else:
     section_header("2", "조회할 품목")
     selected_seqs = [seq for seq in st.session_state.selection if seq in by_seq]
+    st.session_state.sel_rendered = selected_seqs
     if selected_seqs:
         selected_df = pd.DataFrame([
             {"의약품명": by_seq[seq].get("ITEM_NAME", ""), "제약사": by_seq[seq].get("ENTP_NAME", ""), "품목코드": seq}
             for seq in selected_seqs
         ])
-        selected_event = st.dataframe(
-            selected_df, use_container_width=True, hide_index=True,
-            selection_mode="multi-row", on_select="rerun", key="selected_items_table",
-        )
+        table_col, arrow_col = st.columns([12, 1])
+        with table_col:
+            selected_event = st.dataframe(
+                selected_df, use_container_width=True, hide_index=True,
+                selection_mode="multi-row", on_select="rerun",
+                key=f"selected_items_table_{st.session_state.sel_table_ver}",
+            )
         remove_seqs = {
             str(selected_df.iloc[index]["품목코드"])
             for index in selected_event.selection.rows if 0 <= index < len(selected_df)
         }
+        with arrow_col:
+            st.button("↑", key="sel_move_up", disabled=not remove_seqs,
+                      on_click=move_selected_items, args=(-1,), use_container_width=True,
+                      help="체크한 품목을 한 칸 위로")
+            st.button("↓", key="sel_move_down", disabled=not remove_seqs,
+                      on_click=move_selected_items, args=(1,), use_container_width=True,
+                      help="체크한 품목을 한 칸 아래로")
         if st.button("선택한 품목 제거", disabled=not remove_seqs, key="remove_selected_items"):
             st.session_state.selection = [seq for seq in st.session_state.selection if seq not in remove_seqs]
             st.rerun()
