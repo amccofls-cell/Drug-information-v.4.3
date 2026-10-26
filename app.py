@@ -14,6 +14,8 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
+import comparison_extras as cx
+
 # ─────────────────────────────────────────────────────────────
 # 의약품 허가정보·약가 통합 조회 — Streamlit version
 # 기존 Colab 노트북의 API 엔드포인트/필드명/매칭 규칙을 유지합니다.
@@ -81,7 +83,7 @@ NEW_DRUG_PRESET_KEYS = [
     "유효기간", "성상", "전문일반구분", "보관정보", "보관_취급주의사항",
 ]
 ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명", "희귀의약품"]
-RESULT_COLUMN_ORDER = ["구분", "함량", "허가제품명", "제약사한글명", "희귀의약품", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
+RESULT_COLUMN_ORDER = ["구분", "함량", "허가제품명", "원내코드", "제약사한글명", "희귀의약품", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
 MAX_RETRY = 5
 MFDS_RAW_EXCLUDED_FIELDS = {
@@ -239,6 +241,158 @@ def move_selected_items(delta):
     st.session_state.sel_table_ver = st.session_state.get("sel_table_ver", 0) + 1
 
 
+# ── 앱 입력용 파일로 품목 추가 (원내 비교 후보 추출 프로그램에서 만든 파일) ──
+APP_INPUT_COLUMNS = ["구분", "약품명", "성분명", "보험코드"]  # 신청번호 열은 있으면 씁니다 (신청의약품별 비교표)
+STRENGTH_IN_NAME = re.compile(r"\d+(?:\.\d+)?\s*(?:마이크로그램|밀리그램|그램|밀리리터|mcg|μg|ug|mg|g|ml|mL|%)", re.IGNORECASE)
+
+
+def normalize_product_name(name):
+    """제품명 비교용: 심평원 이름 끝의 '_(규격)'과 띄어쓰기를 빼고 대소문자를 맞춥니다."""
+    value = re.sub(r"_\(.*?\)\s*$", "", clean_whitespace(name))
+    return re.sub(r"\s+", "", value).casefold()
+
+
+def product_name_index(rows):
+    index = {}
+    for row in rows:
+        index.setdefault(normalize_product_name(row.get("ITEM_NAME", "")), []).append(row)
+    return index
+
+
+def name_candidates(rows, name, limit=20):
+    """자동 연결이 안 될 때 고를 수 있도록, 함량·괄호를 뺀 이름이 들어간 식약처 품목을 보여 줍니다."""
+    base = re.sub(r"\(.*?\)|\[.*?\]", "", clean_whitespace(name))
+    base = normalize_product_name(STRENGTH_IN_NAME.sub("", base))
+    if len(base) < 2:
+        return []
+    return [row for row in rows if base in normalize_product_name(row.get("ITEM_NAME", ""))][:limit]
+
+
+# 성분명 비교용: 염·수화물 표기는 뺍니다 (원내 비교 후보 추출 프로그램과 같은 규칙)
+SALT_WORDS_KO = [
+    "브롬화수소산염", "타르타르산염", "시트르산염", "말레산염", "베실산염", "메실산염", "푸마르산염", "숙신산염",
+    "아세트산염", "염산염", "황산염", "인산염", "베실레이트", "삼수화물", "이수화물", "일수화물", "수화물",
+    "무수물", "미분화", "나트륨", "칼륨", "칼슘", "마그네슘",
+]
+SALT_WORDS_EN = [
+    "hydrobromide", "hydrochloride", "bitartrate", "tartrate", "citrate", "maleate", "besylate", "besilate",
+    "mesylate", "mesilate", "fumarate", "succinate", "phosphate", "acetate", "sulfate", "sulphate", "hcl",
+    "monohydrate", "dihydrate", "trihydrate", "hydrate", "anhydrous", "micronized", "micronised",
+    "sodium", "potassium", "calcium", "magnesium",
+]
+
+
+def ingredient_keys(text):
+    """성분명을 비교용 성분 묶음으로 바꿉니다. 예: '펜타닐시트르산염' → {'펜타닐'}, 'Oxycodone HCl/Naloxone' → {'oxycodone', 'naloxone'}"""
+    keys = set()
+    for part in re.split(r"[|+/,·;]|\s및\s|\sand\s", clean_ingredient(text or ""), flags=re.IGNORECASE):
+        value = re.sub(r"\(.*?\)|\[.*?\]", " ", part).lower()
+        value = re.sub(r"^\s*\d+(?:,\d+)*-", "", value)  # 앞의 위치 번호는 뺍니다: '5-fluorouracil' = 'fluorouracil'
+        for word in SALT_WORDS_EN:
+            value = re.sub(rf"\b{word}\b", " ", value)
+        for word in SALT_WORDS_KO:
+            value = value.replace(word, " ")
+        value = re.sub(r"[^0-9a-z가-힣]", "", value)
+        if value:
+            keys.add(value)
+    return frozenset(keys)
+
+
+def ingredient_index(rows):
+    """성분 묶음 → 식약처 품목 목록. 한글·영문 성분명 둘 다로 찾을 수 있게 만듭니다."""
+    index = {}
+    for row in rows:
+        for keys in {ingredient_keys(row.get("MAIN_ITEM_INGR", "")), ingredient_keys(row.get("MAIN_INGR_ENG", ""))}:
+            if keys:
+                index.setdefault(keys, []).append(row)
+    return index
+
+
+def ingredient_candidates(index, ingredient, limit=20):
+    """이름으로도 못 찾을 때, 성분이 같은 식약처 품목을 후보로 보여 줍니다 (자동 연결은 하지 않음)."""
+    return index.get(ingredient_keys(ingredient), [])[:limit]
+
+
+def link_app_input(frame, rows, mfds_key, hira_key):
+    """앱 입력용 파일의 줄마다 식약처 품목을 찾습니다. 비슷한 이름이나 같은 성분만으로는 자동 연결하지 않습니다.
+
+    찾는 순서: EDI(보험)코드 → 한글 약품명 → 성분명
+    1) 보험코드 → 심평원 제품명 → 같은 이름의 식약처 품목 → 바코드 4~11번째 = 보험코드 앞 8자리면 자동 연결
+    2) 식약처 제품명과 완전히 같으면 자동 연결
+    3) 나머지는 후보를 보여 주고 약사가 고름: 보험코드로 찾은 품목 → 이름이 들어간 품목 → 성분이 같은 품목 순
+    """
+    name_index = product_name_index(rows)
+    by_ingredient = None  # 성분으로 찾을 일이 생길 때 한 번만 만듭니다
+    cache_detail = load_json_cache(CACHE_DETAIL_FILE)
+    call_counter = {"hira": 0, "mfds": 0}
+    errors, links = [], []
+    for _, row in frame.iterrows():
+        edi = next((code for code in (normalize_code_digits(v) for v in str(row.get("보험코드", "")).split()) if code), "")
+        name = clean_whitespace(row.get("약품명", ""))
+        ingredient = clean_whitespace(row.get("성분명", ""))
+        link = {"구분": clean_whitespace(row.get("구분", "")), "입력 약품명": name, "보험코드": edi,
+                "seq": "", "연결 품목": "", "방법": "", "후보": [], "후보 근거": ""}
+        if edi and hira_key:
+            try:
+                items = hira_get(hira_key, {"mdsCd": edi})
+            except (requests.RequestException, ValueError) as exc:
+                errors.append(f"HIRA mdsCd={edi}: {exc}")
+                items = []
+            for item in (it for it in items if hira_code(it) == edi):
+                matches = name_index.get(normalize_product_name(item.get("itmNm", "")), [])
+                for match in matches:
+                    detail = fetch_detail(match["ITEM_SEQ"], mfds_key, call_counter, cache_detail, [], errors)
+                    if any(code[3:11] == edi[:8] for code in split_barcode_values(detail.get("_bar_code", ""))):
+                        link.update(seq=match["ITEM_SEQ"], 방법="보험코드 → 심평원 제품명 → 바코드 확인")
+                        break
+                if link["seq"]:
+                    break
+                if matches and not link["후보"]:
+                    link.update(후보=matches, **{"후보 근거": "보험코드"})
+        if not link["seq"]:
+            matches = name_index.get(normalize_product_name(name), [])
+            if len(matches) == 1:
+                link.update(seq=matches[0]["ITEM_SEQ"], 방법="식약처 제품명 완전일치")
+            elif not link["후보"]:
+                candidates, basis = matches or name_candidates(rows, name), "약품명"
+                if not candidates and ingredient:
+                    by_ingredient = by_ingredient if by_ingredient is not None else ingredient_index(rows)
+                    candidates, basis = ingredient_candidates(by_ingredient, ingredient), "성분명"
+                if candidates:
+                    link.update(후보=candidates, **{"후보 근거": basis})
+        if link["seq"]:
+            matched = next(r for r in rows if r.get("ITEM_SEQ") == link["seq"])
+            link["연결 품목"] = clean_whitespace(matched.get("ITEM_NAME", ""))
+        link["후보"] = [{"ITEM_SEQ": r.get("ITEM_SEQ", ""), "ITEM_NAME": r.get("ITEM_NAME", ""), "ENTP_NAME": r.get("ENTP_NAME", "")}
+                       for r in link["후보"]]
+        links.append(link)
+    save_json_cache(CACHE_DETAIL_FILE, cache_detail)
+    return links, errors
+
+
+def apply_file_links(links, replace):
+    """연결된 품목을 신청의약품·비교의약품 그룹에 넣고 그룹 모드를 켭니다. (버튼 on_click용)"""
+    if replace:
+        st.session_state.groups = {"applicant": {"label": "신청의약품", "seqs": []}}
+        st.session_state.strength_overrides = {}
+    for index, link in enumerate(links):
+        seq = link["seq"]
+        if not seq:
+            pick = st.session_state.get(f"link_pick_{index}", "")
+            seq = pick.rsplit(" · ", 1)[-1] if " · " in pick else ""
+        if not seq:
+            continue
+        if link["구분"] == "신청의약품":
+            gid = "applicant"
+        else:
+            gid = f"comparator_{re.sub(r'[^0-9]', '', link['구분']) or '1'}"
+        st.session_state.groups.setdefault(gid, {"label": group_label(gid), "seqs": []})
+        assign_seqs_to_group(gid, [seq])
+    st.session_state.group_mode = True
+    st.session_state.group_mode_previous = True  # 그룹 모드로 바뀔 때 예전 조회 목록이 신청의약품으로 섞이지 않게 합니다.
+    st.session_state.file_links = None
+
+
 def build_group_items(by_seq):
     items = []
     for gid in ordered_group_ids(st.session_state.groups):
@@ -386,6 +540,41 @@ def parse_doc_sections(xml_str, keywords):
     return clean_markup(" ".join(picked))
 
 
+def parse_text_sections(text, keywords):
+    """PDF에서 읽은 사용상 주의사항 글에서 '4. 이상반응'처럼 번호로 시작하는 소제목 줄을 찾아, 키워드에 맞는 항목만 꺼냅니다.
+
+    소제목은 줄 맨 앞의 번호가 1, 2, 3… 차례로 커지고, 알려진 항목 이름(경고, 금기, 이상반응 등)이 들어 있는 줄만 인정합니다.
+    (본문 안의 '1) 2)'나 용량 숫자를 소제목으로 착각하지 않도록)
+    """
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    known = {normalize_section_title(k) for words in EXTRA_FIELD_KEYWORDS.values() for k in words} | {"경고"}
+    headings, last = [], 0
+    for index, line in enumerate(lines):
+        match = re.match(r"(\d{1,2})\s*\.\s*(?=[가-힣])", line)
+        if not match:
+            continue
+        title = normalize_section_title(line[match.end():])
+        if int(match.group(1)) == last + 1 and any(word in title for word in known if word):
+            headings.append((index, title))
+            last = int(match.group(1))
+    wanted = [normalize_section_title(k) for k in keywords if k]
+    picked = []
+    for n, (index, title) in enumerate(headings):
+        if any(word in title for word in wanted if word):
+            end = headings[n + 1][0] if n + 1 < len(headings) else len(lines)
+            picked.append(" ".join(lines[index:end]))
+    return clean_whitespace(" ".join(picked))
+
+
+def doc_section(cached, keywords):
+    """사용상 주의사항 세부 항목: XML이 있으면 XML에서, 없으면 PDF에서 읽은 글에서 꺼냅니다."""
+    if (cached.get("_raw_nb_xml") or "").strip():
+        return parse_doc_sections(cached["_raw_nb_xml"], keywords)
+    return parse_text_sections(cached.get("_raw_nb_text", ""), keywords)
+
+
 def summarize_text(text, max_chars=420, max_sentences=3):
     """의학적 판단을 새로 생성하지 않고, 원문 앞부분과 핵심 문장만 발췌합니다."""
     text = clean_whitespace(text)
@@ -433,6 +622,9 @@ def make_summary_df(result_df):
     if "용법용량" in summary_df.columns:
         summary_df["용법용량"] = summary_df["용법용량"].map(lambda value: summarize_usage(value))
     for column in summary_df.columns:
+        # 간단/일반/상세로 바꾼 용법용량 열("용법용량 (일반)" 등)은 이미 요약본이므로 다시 자르지 않습니다.
+        if str(column).startswith("용법용량") or column in cx.MANUAL_COLUMNS:
+            continue
         if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "약가", "약효분류", "주성분영문명", "영문제품명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보"}:
             summary_df[column] = summary_df[column].map(lambda value: summarize_text(value, max_chars=260, max_sentences=2))
     return summary_df
@@ -987,64 +1179,10 @@ def get_effect_classification(item_name, bar_code, service_key, call_counter, ca
     return value
 
 
-DOC_REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (drug-information app)"}
-
-
-def doc_urls(doc_id):
-    """문서 주소 후보. 식약처가 주소를 모두 대문자로 보내므로('HTTPS://NEDRUG.MFDS.GO.KR/PBP/CMN/PDFDOWNLOAD/200700547/EE'),
-    실제 주소 모양('https://nedrug.mfds.go.kr/pbp/cmn/pdfDownload/200700547/EE')을 먼저 시도하고, 받은 주소 그대로도 시도합니다."""
-    doc_id = clean_whitespace(doc_id)
-    if not doc_id.lower().startswith("http"):
-        return []
-    urls = []
-    match = re.search(r"/pdfdownload/(\d+)/([a-z]+)\s*$", doc_id, re.IGNORECASE)
-    if match:
-        urls.append(f"https://nedrug.mfds.go.kr/pbp/cmn/pdfDownload/{match.group(1)}/{match.group(2).upper()}")
-    if doc_id not in urls:
-        urls.append(doc_id)
-    return urls
-
-
-def fetch_doc_by_id(doc_id, errors=None, label=""):
-    """식약처가 문서 본문(EE/UD/NB_DOC_DATA)을 비워 보낼 때, 문서 주소(EE/UD/NB_DOC_ID)에서 직접 받아옵니다.
-
-    PDF나 XML일 때만 씁니다. 오류 안내 웹페이지(HTML) 같은 것은 효능효과로 넣지 않습니다.
-    반환: (읽은 글, XML 원문 또는 "") — XML이면 사용상 주의사항 세부 항목도 나눌 수 있습니다.
-    """
-    problems = []
-    for url in doc_urls(doc_id):
-        try:
-            resp = requests.get(url, headers=DOC_REQUEST_HEADERS, timeout=30)
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            problems.append(f"{url}: {exc}")
-            continue
-        body = resp.content
-        if body[:5] == b"%PDF-":
-            try:
-                from pypdf import PdfReader
-                pages = PdfReader(io.BytesIO(body)).pages
-                text = clean_markup(" ".join((page.extract_text() or "") for page in pages))
-            except Exception as exc:  # 깨진 PDF 등: 이유를 남기고 다음 주소를 시도합니다.
-                problems.append(f"{url}: PDF 읽기 실패 {exc}")
-                continue
-            if text:
-                return text, ""
-            problems.append(f"{url}: PDF에 글자가 없음 (그림으로 된 PDF일 수 있음)")
-            continue
-        text = resp.text.lstrip("\ufeff").strip()
-        if text.startswith("<?xml") or text.startswith("<DOC"):
-            return parse_nested_doc_xml(text), text
-        problems.append(f"{url}: PDF·XML이 아님 ({resp.headers.get('Content-Type', '')}, 앞부분 {text[:60]!r})")
-    if problems and errors is not None:
-        errors.append(f"식약처 문서 {label}: " + " / ".join(problems))
-    return "", ""
-
-
 def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors, include_all_fields=False):
     cached = cache_detail.get(item_seq, {})
     # 효능효과·용법용량이 비어서 저장된 기록은 완성된 것으로 보지 않고 다시 조회합니다.
-    # (식약처가 문서 본문을 비워 보낸 동안 저장된 빈 값이 계속 남지 않게 합니다)
+    # (식약처가 문서 항목을 비워 보내는 날이 있어, 그 빈 값이 계속 남지 않게 합니다)
     have_base = "성분명" in cached and bool(cached.get("효능효과") or cached.get("용법용량"))
     missing_extras = [key for key in wanted_extras if key not in cached or not clean_whitespace(cached.get(key, ""))]
     have_all_fields = "_all_api_fields" in cached
@@ -1054,12 +1192,14 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
         key not in EXTRA_DIRECT_FIELDS or ("_raw_" + key) in cached
         for key in missing_extras
     )
-    if have_base and "_raw_nb_xml" in cached and cached_direct_ready and (not include_all_fields or have_all_fields):
+    section_missing = any(key not in EXTRA_DIRECT_FIELDS for key in missing_extras)
+    nb_ready = bool((cached.get("_raw_nb_xml") or "").strip() or cached.get("_raw_nb_text")) or not section_missing
+    if have_base and "_raw_nb_xml" in cached and nb_ready and cached_direct_ready and (not include_all_fields or have_all_fields):
         for key in missing_extras:
             if key in EXTRA_DIRECT_FIELDS:
                 cached[key] = cached.get("_raw_" + key, "")
             else:
-                cached[key] = parse_doc_sections(cached["_raw_nb_xml"], EXTRA_FIELD_KEYWORDS[key])
+                cached[key] = doc_section(cached, EXTRA_FIELD_KEYWORDS[key])
         cache_detail[item_seq] = cached
         return cached
     if call_counter["mfds"] >= MFDS_CALL_LIMIT:
@@ -1079,17 +1219,19 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     cached["성분명"] = clean_ingredient(item.get("MAIN_ITEM_INGR", ""))
     cached["효능효과"] = parse_nested_doc_xml(item.get("EE_DOC_DATA") or "")
     cached["용법용량"] = parse_nested_doc_xml(item.get("UD_DOC_DATA") or "")
-    # 2026년 10월 무렵부터 식약처가 문서 본문을 비워 보내고 문서 주소(*_DOC_ID, PDF)만 줍니다. 그때는 주소에서 받아옵니다.
+    # 2026년 10월 무렵부터 식약처가 문서 본문을 비워 보내고 문서 주소(*_DOC_ID)만 줍니다. 그때는 주소에서 받아옵니다.
     if not cached["효능효과"]:
         cached["효능효과"], _ = fetch_doc_by_id(item.get("EE_DOC_ID", ""), errors, f"효능효과 item_seq={item_seq}")
     if not cached["용법용량"]:
         cached["용법용량"], _ = fetch_doc_by_id(item.get("UD_DOC_ID", ""), errors, f"용법용량 item_seq={item_seq}")
-    if not nb_xml.strip() and wanted_extras:
-        _, nb_xml = fetch_doc_by_id(item.get("NB_DOC_ID", ""), errors, f"사용상 주의사항 item_seq={item_seq}")
+    nb_text = ""
+    if not nb_xml.strip() and any(key not in EXTRA_DIRECT_FIELDS for key in wanted_extras):
+        nb_text, nb_xml = fetch_doc_by_id(item.get("NB_DOC_ID", ""), errors, f"사용상 주의사항 item_seq={item_seq}", keep_lines=True)
     # 목록 API(getDrugPrdtPrmsnInq07)에는 바코드 필드가 없으므로, 상세 API 응답에서 받아 캐시합니다.
     cached["_bar_code"] = item.get("BAR_CODE", "")
     cached["_edi_code"] = item.get("EDI_CODE", "")
     cached["_raw_nb_xml"] = nb_xml
+    cached["_raw_nb_text"] = "" if nb_xml.strip() else nb_text
     cached["_all_api_fields"] = sanitize_all_api_fields({
         str(key): clean_whitespace(value)
         for key, value in item.items()
@@ -1098,9 +1240,122 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     for key, field in EXTRA_DIRECT_FIELDS.items():
         cached["_raw_" + key] = clean_whitespace(item.get(field, ""))
     for key in wanted_extras:
-        cached[key] = cached.get("_raw_" + key, "") if key in EXTRA_DIRECT_FIELDS else parse_doc_sections(nb_xml, EXTRA_FIELD_KEYWORDS[key])
+        cached[key] = cached.get("_raw_" + key, "") if key in EXTRA_DIRECT_FIELDS else doc_section(cached, EXTRA_FIELD_KEYWORDS[key])
     cache_detail[item_seq] = cached
     return cached
+
+
+DOC_REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (drug-information app)"}
+
+
+def doc_urls(doc_id):
+    """문서 주소 후보. 식약처가 주소를 모두 대문자로 보내므로('HTTPS://NEDRUG.MFDS.GO.KR/PBP/CMN/PDFDOWNLOAD/200700547/EE'),
+    실제 주소 모양('https://nedrug.mfds.go.kr/pbp/cmn/pdfDownload/200700547/EE')을 먼저 시도하고, 받은 주소 그대로도 시도합니다."""
+    doc_id = clean_whitespace(doc_id)
+    if not doc_id.lower().startswith("http"):
+        return []
+    urls = []
+    match = re.search(r"/pdfdownload/(\d+)/([a-z]+)\s*$", doc_id, re.IGNORECASE)
+    if match:
+        urls.append(f"https://nedrug.mfds.go.kr/pbp/cmn/pdfDownload/{match.group(1)}/{match.group(2).upper()}")
+    if doc_id not in urls:
+        urls.append(doc_id)
+    return urls
+
+
+def fetch_doc_by_id(doc_id, errors=None, label="", keep_lines=False):
+    """식약처가 문서 본문(EE/UD/NB_DOC_DATA)을 비워 보낼 때, 문서 주소(EE/UD/NB_DOC_ID)에서 직접 받아옵니다.
+
+    PDF나 XML일 때만 씁니다. 오류 안내 웹페이지(HTML) 같은 것은 효능효과로 넣지 않습니다.
+    반환: (읽은 글, XML 원문 또는 "") — XML이면 사용상 주의사항 세부 항목도 나눌 수 있습니다.
+    """
+    problems = []
+    for url in doc_urls(doc_id):
+        try:
+            resp = requests.get(url, headers=DOC_REQUEST_HEADERS, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            problems.append(f"{url}: {exc}")
+            continue
+        body = resp.content
+        if body[:5] == b"%PDF-":
+            try:
+                from pypdf import PdfReader
+                pages = PdfReader(io.BytesIO(body)).pages
+                raw_text = "\n".join((page.extract_text() or "") for page in pages)
+                # keep_lines: 사용상 주의사항처럼 줄 단위 소제목으로 나눌 문서는 줄바꿈을 남깁니다.
+                text = "\n".join(filter(None, (clean_markup(line) for line in raw_text.splitlines()))) if keep_lines else clean_markup(raw_text)
+            except Exception as exc:  # 깨진 PDF 등: 이유를 남기고 다음 주소를 시도합니다.
+                problems.append(f"{url}: PDF 읽기 실패 {exc}")
+                continue
+            if text:
+                return text, ""
+            problems.append(f"{url}: PDF에 글자가 없음 (그림으로 된 PDF일 수 있음)")
+            continue
+        text = resp.text.lstrip("\ufeff").strip()
+        if text.startswith("<?xml") or text.startswith("<DOC"):
+            return parse_nested_doc_xml(text), text
+        problems.append(f"{url}: PDF·XML이 아님 ({resp.headers.get('Content-Type', '')}, 앞부분 {text[:60]!r})")
+    if problems and errors is not None:
+        errors.append(f"식약처 문서 {label}: " + " / ".join(problems))
+    return "", ""
+
+
+def _mask_key(text, key):
+    """화면에 보여 줄 글에서 인증키를 가립니다."""
+    text = str(text)
+    for value in {key, requests.utils.quote(key or "", safe="")}:
+        if value:
+            text = text.replace(value, "****")
+    return re.sub(r"(serviceKey=)[^&\s]+", r"\1****", text)
+
+
+def diagnose_mfds_detail(item_seq, service_key):
+    """식약처 상세 API 응답에서 효능효과(EE)·용법용량(UD)·주의사항(NB) 문서가 어떻게 오는지 요약합니다."""
+    lines = [f"주소: {MFDS_DETAIL_URL}", f"품목기준코드: {item_seq}"]
+    for response_type in ("json", "xml"):
+        lines.append(f"\n[type={response_type}]")
+        resp = None
+        try:
+            resp = requests.get(MFDS_DETAIL_URL, params={"serviceKey": service_key, "item_seq": item_seq, "type": response_type}, timeout=30)
+            lines.append(f"HTTP {resp.status_code} · {resp.headers.get('Content-Type', '')} · {len(resp.text):,}자")
+            items = _parse_response_items(resp, "MFDS 상세")
+        except Exception as exc:  # 점검 화면이라 어떤 오류든 그대로 보여 줍니다 (키는 가림).
+            lines.append(f"오류: {_mask_key(exc, service_key)}")
+            if resp is not None:
+                lines.append(f"응답 앞부분: {_mask_key(resp.text[:300], service_key)}")
+            continue
+        if not items:
+            lines.append(f"items 없음. 응답 앞부분: {_mask_key(resp.text[:300], service_key)}")
+            continue
+        item = items[0]
+        lines.append(f"받은 항목 {len(item)}개: {', '.join(list(item)[:40])}")
+        for field in ("EE_DOC_DATA", "UD_DOC_DATA", "NB_DOC_DATA"):
+            value = item.get(field)
+            if value is None:
+                lines.append(f"{field}: {'값이 비어 있음 (null)' if field in item else '항목 자체가 없음'}")
+                continue
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            parsed = parse_nested_doc_xml(text)
+            lines.append(f"{field}: 형식 {type(value).__name__}, {len(text):,}자, 읽은 글 {len(parsed):,}자")
+            lines.append(f"  앞부분: {text[:200]!r}")
+        for field in ("EE_DOC_ID", "UD_DOC_ID", "NB_DOC_ID", "INSERT_FILE"):
+            lines.append(f"{field}: {_mask_key(item.get(field), service_key)!s}")
+        if response_type == "json":
+            for field in ("EE_DOC_ID", "UD_DOC_ID"):
+                doc_id = clean_whitespace(item.get(field) or "")
+                for url in doc_urls(doc_id):
+                    try:
+                        doc = requests.get(url, headers=DOC_REQUEST_HEADERS, timeout=30)
+                        lines.append(f"{field} 받아 보기 {url}: HTTP {doc.status_code} · {doc.headers.get('Content-Type', '')} · {len(doc.content):,}바이트 · 앞부분 {doc.content[:60]!r}")
+                    except Exception as exc:  # 점검 화면이라 그대로 보여 줍니다.
+                        lines.append(f"{field} 받아 보기 {url} 오류: {exc}")
+                if not doc_urls(doc_id):
+                    continue
+                errors = []
+                text, _ = fetch_doc_by_id(doc_id, errors, field)
+                lines.append(f"  → 읽은 글 {len(text):,}자: {text[:150]!r} {'; '.join(errors)}")
+    return "\n".join(lines)
 
 
 def current_kst_date():
@@ -1228,10 +1483,49 @@ def build_search_index(_normal_rows, cache_day, row_count, detail_mtime):
 
 
 def order_result_columns(df):
-    ordered = [column for column in RESULT_COLUMN_ORDER if column in df.columns]
-    ordered += [column for column in EXTRA_FIELD_ORDER if column in df.columns and column not in ordered]
-    ordered += [column for column in df.columns if column not in ordered]
-    return df[ordered]
+    """기본 순서대로 열을 정렬하고, 사람이 채우는 행(code open, 처방건수, 비급여)은 맨 끝에 둡니다."""
+    def canonical(column):
+        return "용법용량" if str(column).startswith("용법용량 (") else column
+
+    by_canonical = {canonical(column): column for column in df.columns}
+    tail = [column for column in cx.MANUAL_TAIL_COLUMNS if column in df.columns]
+    ordered = [by_canonical[column] for column in RESULT_COLUMN_ORDER if column in by_canonical]
+    ordered += [by_canonical[column] for column in EXTRA_FIELD_ORDER if column in by_canonical and by_canonical[column] not in ordered]
+    ordered += [column for column in df.columns if column not in ordered and column not in tail]
+    return df[ordered + tail]
+
+
+def apply_dosage_version(df, choice):
+    """용법용량 열을 고른 버전(간단/일반/상세)으로 바꾸고 열 이름을 '용법용량 (일반)'처럼 바꿉니다.
+    행 순서는 조회 순서와 같아야 하므로, 정렬하기 전의 조회 결과에 적용합니다."""
+    summaries = st.session_state.get("last_dosage")
+    level = cx.resolve_dosage_choice(choice, summaries)
+    if level == "원문" or "용법용량" not in df.columns:
+        return df, "원문"
+    seqs = st.session_state.get("last_seqs", [])
+    applied = df.copy()
+    applied["용법용량"] = [
+        cx.dosage_cell(
+            summaries["items"].get(str(seqs[position])) if position < len(seqs) else None,
+            level,
+            applied["용법용량"].iloc[position],
+        )
+        for position in range(len(applied))
+    ]
+    return applied.rename(columns={"용법용량": f"용법용량 ({level})"}), level
+
+
+def dosage_products(reference_bundle):
+    """용법·용량 요약에 넘길 제품 목록. 원내코드 같은 대외비 값은 넣지 않습니다."""
+    return [
+        {
+            "id": str(product["mfds"]["item_seq"]),
+            "name": product["mfds"]["product_name"],
+            "dosage_text": product["mfds"]["dosage_text"],
+            "indications_text": product["mfds"]["indications_text"],
+        }
+        for product in reference_bundle.get("products", [])
+    ]
 
 
 def make_display_df(result_df, summary_view=False, transpose_view=False):
@@ -1394,6 +1688,16 @@ def render_resizable_wrapped_table(display_df, show_index=False, height=720, tab
 
 def make_comparison_df(result_df):
     """각 품목을 독립된 열로 표시하며 신청의약품은 맨 오른쪽에 배치합니다."""
+    comparison, comparison_names = comparison_columns(result_df)
+    comparison["_비교용약품명"] = comparison_names
+    result = comparison.set_index("_비교용약품명").T
+    result.index.name = "조회 항목"
+    return result
+
+
+def comparison_columns(result_df):
+    """비교표 열 순서(신청의약품 맨 오른쪽)로 정렬한 표와 각 열 이름을 돌려줍니다.
+    정렬된 표의 index는 원래 조회 결과의 행 번호를 그대로 유지합니다."""
     comparison = result_df.copy()
     if "구분" in comparison.columns:
         comparison["_그룹정렬"] = comparison["구분"].map(
@@ -1411,10 +1715,25 @@ def make_comparison_df(result_df):
         name = f"{prefix} | {product_name}" if prefix else product_name
         seen[name] = seen.get(name, 0) + 1
         comparison_names.append(name if seen[name] == 1 else f"{name} ({seen[name]})")
-    comparison["_비교용약품명"] = comparison_names
-    result = comparison.set_index("_비교용약품명").T
-    result.index.name = "조회 항목"
-    return result
+    return comparison, comparison_names
+
+
+def dosage_sources(result_df, reference_bundle):
+    """Excel '용법용량 원문' 시트에 넣을 내용. 비교표 열 이름으로 이어 두어 나중에 요약을 정확한 칸에 채웁니다."""
+    sorted_df, names = comparison_columns(result_df)
+    name_by_index = dict(zip(sorted_df.index, names))
+    products = (reference_bundle or {}).get("products", [])
+    sources = []
+    for position, row_index in enumerate(result_df.index):
+        mfds = products[position]["mfds"] if position < len(products) else {}
+        sources.append({
+            "column": name_by_index.get(row_index, ""),
+            "id": mfds.get("item_seq", ""),
+            "name": mfds.get("product_name", ""),
+            "indications_text": mfds.get("indications_text", ""),
+            "dosage_text": mfds.get("dosage_text", ""),
+        })
+    return sources
 
 
 def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_lookup=None, include_all_fields=False):
@@ -1439,15 +1758,28 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
             item_seq, mfds_key, call_counter, cache_detail, fetch_keys, errors,
             include_all_fields=include_all_fields,
         )
+        # 상세 조회에 성공하면 바코드 칸이 생기므로, 이 칸이 없으면 조회 실패로 봅니다.
+        detail_failed = "_bar_code" not in detail
         bar_code = detail.get("_bar_code", "")
+        errors_before_price = len(errors)
         price_items, method = match_prices(
             item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors, as_of_date
         )
+        # 상세 조회가 실패하면 바코드로 약가를 확인할 수 없으므로 약가도 조회 실패로 봅니다.
+        price_failed = not price_items and (detail_failed or method == "호출한도초과" or len(errors) > errors_before_price)
         price_item = price_items[0] if price_items else None
+        errors_before_meft = len(errors)
         effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
+        meft_failed = not effect_classification and len(errors) > errors_before_meft
         out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "희귀의약품": detail.get("희귀의약품", ""), "약가": format_price_cell(price_items), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": join_hira_field(price_items, "mdsCd"), "약가적용시작일": join_hira_field(price_items, "adtStaDd"), "판매예정종료일": join_hira_field(price_items, "sellEptDd"), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
+        # 빈 칸은 '조회 실패'와 '자료 없음'으로 나눠 표시합니다. 사람이 채우는 행은 빈칸으로 둡니다.
+        for key in ["희귀의약품", "주성분영문명", "성분명", "효능효과", "용법용량"] + list(wanted_extras):
+            out_row[key] = cx.mark_missing(out_row.get(key, ""), detail_failed)
+        out_row["약가"] = cx.mark_missing(out_row["약가"], price_failed)
+        out_row["약효분류"] = cx.mark_missing(out_row["약효분류"], meft_failed)
+        out_row.update(cx.manual_values(group_meta.get("group_label", "")))
         if include_all_fields:
             for api_key, api_value in sanitize_all_api_fields(detail.get("_all_api_fields", {})).items():
                 out_row.setdefault(f"MFDS_{api_key}", api_value)
@@ -1895,6 +2227,16 @@ with st.sidebar:
                 cache_path.unlink()
         st.rerun()
     st.caption("허가목록은 KST 기준 하루 1회만 자동 갱신합니다. API 키는 파일에 저장하지 않고 Streamlit Secrets/입력값으로만 재사용합니다.")
+    with st.expander("🔧 식약처 상세정보 점검 (효능효과·용법용량이 빈칸일 때)"):
+        st.caption("품목기준코드 하나로 식약처 상세 API를 직접 불러, 효능효과·용법용량 문서가 오는지 보여 줍니다. 인증키는 화면에 나오지 않습니다.")
+        check_seq = st.text_input("품목기준코드", value="200700547", key="mfds_check_seq")
+        if st.button("점검하기", disabled=not mfds_key):
+            st.code(diagnose_mfds_detail(check_seq.strip(), mfds_key), language="text")
+        if st.button("상세정보 캐시 비우기"):
+            if CACHE_DETAIL_FILE.exists():
+                CACHE_DETAIL_FILE.unlink()
+            st.cache_resource.clear()
+            st.success("상세정보 캐시를 비웠습니다. 다음 조회 때 식약처에서 새로 받아옵니다.")
     st.divider()
     st.markdown("**저장 위치**")
     st.code(str(DATA_DIR), language="text")
@@ -1929,6 +2271,9 @@ if "last_result" not in st.session_state:
     st.session_state.last_result = None
 if "last_errors" not in st.session_state:
     st.session_state.last_errors = []
+if "last_dosage" not in st.session_state:
+    st.session_state.last_dosage = None
+    st.session_state.last_seqs = []
 if "last_reference_json" not in st.session_state:
     st.session_state.last_reference_json = None
 if "group_mode" not in st.session_state:
@@ -1952,6 +2297,56 @@ if group_mode and not previous_group_mode:
 elif not group_mode and previous_group_mode:
     st.session_state.selection = list(dict.fromkeys(flatten_group_seqs()))
 st.session_state.group_mode_previous = group_mode
+
+with st.expander("📂 파일로 품목 추가 (원내 비교 후보 추출 프로그램의 '앱 입력용 파일')"):
+    st.caption(
+        "EDI(보험)코드 → 한글 약품명 → 성분명 순서로 찾습니다. "
+        "보험코드가 있으면 심평원 제품명과 바코드로 확인해 자동으로 연결하고, 없으면 식약처 제품명과 완전히 같을 때만 자동으로 연결합니다. "
+        "나머지는 이름이나 성분이 같은 후보 중에서 직접 골라 주세요."
+    )
+    app_input_file = st.file_uploader("앱 입력용 파일 (xlsx)", type=["xlsx"], key="app_input_file")
+    input_frame, number_choice = None, None
+    if app_input_file:
+        input_frame = pd.read_excel(app_input_file, dtype=str).fillna("")
+        if "신청번호" in input_frame.columns and input_frame["신청번호"].str.strip().any():
+            # 신청번호마다 비교표를 하나씩 만듭니다: 고른 번호의 신청의약품과 그 비교약만 불러옵니다.
+            numbers = list(dict.fromkeys(n for n in input_frame["신청번호"].str.strip() if n))
+            names = {
+                n: ", ".join(input_frame[(input_frame["신청번호"].str.strip() == n) & (input_frame["구분"] == "신청의약품")]["약품명"].head(3))
+                for n in numbers
+            }
+            number_choice = st.selectbox(
+                "어느 신청의약품의 비교표를 만들까요? (신청번호를 바꿔 가며 하나씩 만드세요)",
+                numbers, format_func=lambda n: f"{n} · {names.get(n) or '(신청의약품 없음)'}", key="app_input_number",
+            )
+    replace_groups = st.checkbox("지금 고른 품목을 비우고 파일 내용으로 새로 채우기", value=True, key="app_input_replace")
+    if input_frame is not None and st.button("파일 읽고 품목 연결하기", disabled=not hira_key):
+        missing_columns = [column for column in APP_INPUT_COLUMNS if column not in input_frame.columns]
+        if missing_columns:
+            st.error(f"앱 입력용 파일에 {', '.join(missing_columns)} 열이 없습니다.")
+        else:
+            if number_choice:
+                input_frame = input_frame[input_frame["신청번호"].str.strip() == number_choice]
+            with st.spinner("보험코드, 약품명, 성분명으로 품목을 찾는 중입니다…"):
+                st.session_state.file_links, link_errors = link_app_input(input_frame, normal_rows, mfds_key, hira_key)
+            for link_error in link_errors:
+                st.warning(link_error)
+    file_links = st.session_state.get("file_links")
+    if file_links:
+        auto_count = sum(1 for link in file_links if link["seq"])
+        st.markdown(f"**자동 연결 {auto_count}건 / 직접 확인 {len(file_links) - auto_count}건**")
+        for index, link in enumerate(file_links):
+            label = f"{link['구분']} · {link['입력 약품명']}" + (f" (보험코드 {link['보험코드']})" if link["보험코드"] else "")
+            if link["seq"]:
+                st.markdown(f"✅ {label} → **{link['연결 품목']}** · {link['방법']}")
+            else:
+                choices = ["(넣지 않음)"] + [f"{c['ITEM_NAME']} · {c['ENTP_NAME']} · {c['ITEM_SEQ']}" for c in link["후보"]]
+                st.selectbox(
+                    f"⚠️ {label} — " + (f"{link.get('후보 근거') or '이름'}으로 찾은 후보 중에서 골라 주세요" if link["후보"]
+                                       else "찾지 못했습니다. 검색에서 직접 추가해 주세요"),
+                    choices, key=f"link_pick_{index}",
+                )
+        st.button("그룹에 추가", type="primary", on_click=apply_file_links, args=(file_links, replace_groups))
 
 query = st.text_input(
     "의약품명 · 제약사명 · 성분명 · 주성분 영문명",
@@ -2140,6 +2535,14 @@ summary_view = st.checkbox(
     help="AI가 새로운 의학적 판단을 생성하지 않고, 원문에서 앞부분과 문장 단위 내용을 발췌해 짧게 표시합니다.",
 )
 
+dosage_choice = st.radio(
+    "용법·용량 표시",
+    cx.DOSAGE_CHOICES,
+    horizontal=True,
+    key="dosage_choice",
+    help="간단/일반/상세는 원문 앞부분을 잘라 보여 주는 미리보기입니다. 기준에 맞춘 최종 요약은 Excel을 받아 Claude에게 '용법·용량 요약해 줘'라고 요청하세요. Excel에는 항상 원문 시트가 들어갑니다.",
+)
+
 price_reference_date = st.date_input(
     "심평원 약가 기준일",
     value=datetime.now(KST).date(),
@@ -2165,12 +2568,48 @@ if st.button(lookup_button_label, type="primary", disabled=not selected_seqs or 
     st.session_state.last_result = result_df
     st.session_state.last_errors = errors
     st.session_state.last_reference_json = reference_bundle
+    st.session_state.last_dosage = cx.build_dosage_summaries(dosage_products(reference_bundle))
+    st.session_state.last_seqs = [str(product["mfds"]["item_seq"]) for product in reference_bundle["products"]]
     st.rerun()
 
 if st.session_state.last_result is not None:
     section_header("4", "조회 결과")
     result_df = st.session_state.last_result
-    filtered_result_df = result_df
+    filtered_result_df, dosage_level = apply_dosage_version(result_df, dosage_choice)
+
+    dosage_info = st.session_state.last_dosage
+    if dosage_info:
+        shown = "원문" if dosage_level == "원문" else f"{dosage_level} 버전"
+        st.caption(
+            f"용법·용량: **{shown}** 표시 중 · 추천 버전은 **{dosage_info['recommended_level']}** "
+            f"({dosage_info['reason']}) · 화면의 간단/일반/상세는 원문 발췌 미리보기입니다. "
+            "기준에 맞춘 최종 요약은 Excel을 받아 Claude에게 '용법·용량 요약해 줘'라고 요청하세요."
+        )
+        if dosage_info.get("warnings"):
+            with st.expander(f"용법·용량 요약 확인 필요 {len(dosage_info['warnings'])}건"):
+                for warning in dosage_info["warnings"]:
+                    st.warning(warning)
+
+    excel_comparison = (
+        make_comparison_df(apply_text_layout(make_summary_df(filtered_result_df) if summary_view else filtered_result_df))
+        if len(filtered_result_df) >= 2 else None
+    )
+    excel_detail = make_display_df(filtered_result_df, summary_view=summary_view, transpose_view=False)
+    excel_date = (st.session_state.last_reference_json or {}).get("reference_date", "")
+    st.download_button(
+        "비교표 Excel 다운로드",
+        data=cx.to_excel_bytes(
+            excel_comparison, excel_detail, title="의약품 비교표",
+            note_lines=[
+                f"약가 기준일: {excel_date}",
+                f"용법·용량: {'원문' if dosage_level == '원문' else dosage_level + ' 버전'} ({dosage_info['source'] if dosage_info else '원문'}) — 약사 확인 필요",
+            ],
+            dosage_sources=dosage_sources(result_df, st.session_state.last_reference_json),
+        ),
+        file_name=f"의약품비교표_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
 
     result_tab, comparison_tab = st.tabs(["상세 결과", "여러 약품 비교표"])
 
@@ -2215,7 +2654,7 @@ if st.session_state.last_result is not None:
         if len(filtered_result_df) < 2:
             st.info("두 품목 이상 조회하면 비교표가 표시됩니다.")
         else:
-            comparison_df = make_comparison_df(apply_text_layout(make_summary_df(filtered_result_df) if summary_view else filtered_result_df))
+            comparison_df = excel_comparison
             comparison_caption = (
                 "행은 조회 항목, 열은 그룹·함량별 의약품입니다. 신청의약품은 맨 오른쪽에 표시됩니다."
                 if group_mode else "행은 조회 항목, 열은 선택한 의약품입니다."
