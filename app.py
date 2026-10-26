@@ -392,13 +392,13 @@ def parse_text_sections(text, keywords):
     소제목은 줄 맨 앞의 번호가 1, 2, 3… 차례로 커지고, 알려진 항목 이름(경고, 금기, 이상반응 등)이 들어 있는 줄만 인정합니다.
     (본문 안의 '1) 2)'나 용량 숫자를 소제목으로 착각하지 않도록)
     """
-    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    lines = [line for line in str(text or "").splitlines() if line.strip()]
     if not lines:
         return ""
     known = {normalize_section_title(k) for words in EXTRA_FIELD_KEYWORDS.values() for k in words} | {"경고"}
     headings, last = [], 0
     for index, line in enumerate(lines):
-        match = re.match(r"(\d{1,2})\s*\.\s*(?=[가-힣])", line)
+        match = re.match(r"\s*(\d{1,2})\s*\.\s*(?=[가-힣])", line)
         if not match:
             continue
         title = normalize_section_title(line[match.end():])
@@ -410,7 +410,7 @@ def parse_text_sections(text, keywords):
     for n, (index, title) in enumerate(headings):
         if any(word in title for word in wanted if word):
             end = headings[n + 1][0] if n + 1 < len(headings) else len(lines)
-            picked.append(" ".join(lines[index:end]))
+            picked.append(join_wrapped_lines(lines[index:end]))
     return clean_whitespace(" ".join(picked))
 
 
@@ -1040,6 +1040,38 @@ def doc_urls(doc_id):
     return urls
 
 
+def pdf_plain_text(pages):
+    """PDF 글자를 꺼냅니다. 식약처 PDF는 띄어쓰기가 보이지 않는 NUL 글자(\\x00)로 나오고,
+    같은 줄이 두 번씩 나오는 곳이 있어서 띄어쓰기로 바꾸고 바로 이어 반복된 줄은 하나만 남깁니다."""
+    lines = []
+    for page in pages:
+        for line in (page.extract_text() or "").replace("\x00", " ").splitlines():
+            if not lines or line.strip() != lines[-1].strip():
+                lines.append(line)
+    return "\n".join(lines)
+
+
+LIST_MARKER = re.compile(r"^\s*(\d{1,2}\s*[.)]|\(\d{1,2}\)|[가-하]\s*\.|[①-⑳]|[-·•※*<]|[A-Za-z가-힣/ ]{1,15}:\s*\S)")  # '혈관계: 홍조'처럼 뒤에 내용이 있는 이름표만
+
+
+def join_wrapped_lines(lines):
+    """PDF에서 한 문장이 줄바꿈으로 잘린 곳을 다시 잇습니다.
+    앞줄이 띄어쓰기로 끝나면 띄어 쓰고, 긴 줄이 낱말 중간에서 잘린 곳('투' + '여')은 붙입니다.
+    다음 줄이 '1)', '(2)', '혈관계:'처럼 새 항목으로 시작하면 띄어 씁니다."""
+    text, previous = "", ""
+    for line in lines:
+        if not line.strip():
+            continue
+        if not text:
+            text = line.strip()
+        elif previous.endswith(" ") or len(previous.strip()) < 40 or LIST_MARKER.match(line):
+            text += " " + line.strip()
+        else:
+            text += line.strip()
+        previous = line
+    return clean_whitespace(text)
+
+
 def fetch_doc_by_id(doc_id, errors=None, label="", keep_lines=False):
     """식약처가 문서 본문(EE/UD/NB_DOC_DATA)을 비워 보낼 때, 문서 주소(EE/UD/NB_DOC_ID)에서 직접 받아옵니다.
 
@@ -1059,9 +1091,9 @@ def fetch_doc_by_id(doc_id, errors=None, label="", keep_lines=False):
             try:
                 from pypdf import PdfReader
                 pages = PdfReader(io.BytesIO(body)).pages
-                raw_text = "\n".join((page.extract_text() or "") for page in pages)
-                # keep_lines: 사용상 주의사항처럼 줄 단위 소제목으로 나눌 문서는 줄바꿈을 남깁니다.
-                text = "\n".join(filter(None, (clean_markup(line) for line in raw_text.splitlines()))) if keep_lines else clean_markup(raw_text)
+                raw_text = pdf_plain_text(pages)
+                # keep_lines: 사용상 주의사항처럼 줄 단위 소제목으로 나눌 문서는 줄바꿈을 남깁니다 (줄 끝 띄어쓰기도 남김).
+                text = raw_text if keep_lines else join_wrapped_lines(raw_text.splitlines())
             except Exception as exc:  # 깨진 PDF 등: 이유를 남기고 다음 주소를 시도합니다.
                 problems.append(f"{url}: PDF 읽기 실패 {exc}")
                 continue
