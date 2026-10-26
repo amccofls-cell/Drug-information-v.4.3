@@ -987,9 +987,65 @@ def get_effect_classification(item_name, bar_code, service_key, call_counter, ca
     return value
 
 
+DOC_REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (drug-information app)"}
+
+
+def doc_urls(doc_id):
+    """문서 주소 후보. 식약처가 주소를 모두 대문자로 보내므로('HTTPS://NEDRUG.MFDS.GO.KR/PBP/CMN/PDFDOWNLOAD/200700547/EE'),
+    실제 주소 모양('https://nedrug.mfds.go.kr/pbp/cmn/pdfDownload/200700547/EE')을 먼저 시도하고, 받은 주소 그대로도 시도합니다."""
+    doc_id = clean_whitespace(doc_id)
+    if not doc_id.lower().startswith("http"):
+        return []
+    urls = []
+    match = re.search(r"/pdfdownload/(\d+)/([a-z]+)\s*$", doc_id, re.IGNORECASE)
+    if match:
+        urls.append(f"https://nedrug.mfds.go.kr/pbp/cmn/pdfDownload/{match.group(1)}/{match.group(2).upper()}")
+    if doc_id not in urls:
+        urls.append(doc_id)
+    return urls
+
+
+def fetch_doc_by_id(doc_id, errors=None, label=""):
+    """식약처가 문서 본문(EE/UD/NB_DOC_DATA)을 비워 보낼 때, 문서 주소(EE/UD/NB_DOC_ID)에서 직접 받아옵니다.
+
+    PDF나 XML일 때만 씁니다. 오류 안내 웹페이지(HTML) 같은 것은 효능효과로 넣지 않습니다.
+    반환: (읽은 글, XML 원문 또는 "") — XML이면 사용상 주의사항 세부 항목도 나눌 수 있습니다.
+    """
+    problems = []
+    for url in doc_urls(doc_id):
+        try:
+            resp = requests.get(url, headers=DOC_REQUEST_HEADERS, timeout=30)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            problems.append(f"{url}: {exc}")
+            continue
+        body = resp.content
+        if body[:5] == b"%PDF-":
+            try:
+                from pypdf import PdfReader
+                pages = PdfReader(io.BytesIO(body)).pages
+                text = clean_markup(" ".join((page.extract_text() or "") for page in pages))
+            except Exception as exc:  # 깨진 PDF 등: 이유를 남기고 다음 주소를 시도합니다.
+                problems.append(f"{url}: PDF 읽기 실패 {exc}")
+                continue
+            if text:
+                return text, ""
+            problems.append(f"{url}: PDF에 글자가 없음 (그림으로 된 PDF일 수 있음)")
+            continue
+        text = resp.text.lstrip("\ufeff").strip()
+        if text.startswith("<?xml") or text.startswith("<DOC"):
+            return parse_nested_doc_xml(text), text
+        problems.append(f"{url}: PDF·XML이 아님 ({resp.headers.get('Content-Type', '')}, 앞부분 {text[:60]!r})")
+    if problems and errors is not None:
+        errors.append(f"식약처 문서 {label}: " + " / ".join(problems))
+    return "", ""
+
+
 def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extras, errors, include_all_fields=False):
     cached = cache_detail.get(item_seq, {})
-    have_base = "성분명" in cached
+    # 효능효과·용법용량이 비어서 저장된 기록은 완성된 것으로 보지 않고 다시 조회합니다.
+    # (식약처가 문서 본문을 비워 보낸 동안 저장된 빈 값이 계속 남지 않게 합니다)
+    have_base = "성분명" in cached and bool(cached.get("효능효과") or cached.get("용법용량"))
     missing_extras = [key for key in wanted_extras if key not in cached or not clean_whitespace(cached.get(key, ""))]
     have_all_fields = "_all_api_fields" in cached
     if have_base and not missing_extras and (not include_all_fields or have_all_fields):
@@ -1019,10 +1075,17 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     except (requests.RequestException, ValueError, ET.ParseError) as exc:
         errors.append(f"MFDS 상세 item_seq={item_seq}: {exc}")
         return cached if cached else {"성분명": "", "효능효과": "", "용법용량": ""}
-    nb_xml = item.get("NB_DOC_DATA", "")
+    nb_xml = item.get("NB_DOC_DATA") or ""
     cached["성분명"] = clean_ingredient(item.get("MAIN_ITEM_INGR", ""))
-    cached["효능효과"] = parse_nested_doc_xml(item.get("EE_DOC_DATA", ""))
-    cached["용법용량"] = parse_nested_doc_xml(item.get("UD_DOC_DATA", ""))
+    cached["효능효과"] = parse_nested_doc_xml(item.get("EE_DOC_DATA") or "")
+    cached["용법용량"] = parse_nested_doc_xml(item.get("UD_DOC_DATA") or "")
+    # 2026년 10월 무렵부터 식약처가 문서 본문을 비워 보내고 문서 주소(*_DOC_ID, PDF)만 줍니다. 그때는 주소에서 받아옵니다.
+    if not cached["효능효과"]:
+        cached["효능효과"], _ = fetch_doc_by_id(item.get("EE_DOC_ID", ""), errors, f"효능효과 item_seq={item_seq}")
+    if not cached["용법용량"]:
+        cached["용법용량"], _ = fetch_doc_by_id(item.get("UD_DOC_ID", ""), errors, f"용법용량 item_seq={item_seq}")
+    if not nb_xml.strip() and wanted_extras:
+        _, nb_xml = fetch_doc_by_id(item.get("NB_DOC_ID", ""), errors, f"사용상 주의사항 item_seq={item_seq}")
     # 목록 API(getDrugPrdtPrmsnInq07)에는 바코드 필드가 없으므로, 상세 API 응답에서 받아 캐시합니다.
     cached["_bar_code"] = item.get("BAR_CODE", "")
     cached["_edi_code"] = item.get("EDI_CODE", "")
