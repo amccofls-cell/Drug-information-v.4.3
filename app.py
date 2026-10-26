@@ -1115,6 +1115,10 @@ def fetch_detail(item_seq, service_key, call_counter, cache_detail, wanted_extra
     # 효능효과·용법용량이 비어서 저장된 기록은 완성된 것으로 보지 않고 다시 조회합니다.
     # (식약처가 문서 본문을 비워 보낸 동안 저장된 빈 값이 계속 남지 않게 합니다)
     have_base = "성분명" in cached and bool(cached.get("효능효과") or cached.get("용법용량"))
+    # 예전 버전이 PDF 글자를 띄어쓰기(NUL 글자 \x00)째로 저장한 기록도 다시 조회합니다.
+    if any("\x00" in str(cached.get(key, "")) for key in ("효능효과", "용법용량", "_raw_nb_text")):
+        have_base = False
+        cached.pop("_raw_nb_text", None)
     missing_extras = [key for key in wanted_extras if key not in cached or not clean_whitespace(cached.get(key, ""))]
     have_all_fields = "_all_api_fields" in cached
     if have_base and not missing_extras and (not include_all_fields or have_all_fields):
@@ -1925,8 +1929,11 @@ def section_header(step, title):
         unsafe_allow_html=True,
     )
 
+APP_VERSION = "2026-10-26c · 식약처 PDF 문서 대응"  # 올린 파일이 실제로 반영됐는지 사이드바에서 확인합니다
+
 with st.sidebar:
     st.header("환경 설정")
+    st.caption(f"앱 버전: {APP_VERSION}")
     try:
         secret_mfds = st.secrets.get("MFDS_KEY", "")
         secret_hira = st.secrets.get("HIRA_KEY", "")
