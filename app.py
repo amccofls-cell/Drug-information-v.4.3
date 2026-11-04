@@ -22,6 +22,8 @@ import streamlit.components.v1 as components
 MFDS_LIST_URL = "http://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnInq07"
 MFDS_DETAIL_URL = "https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService07/getDrugPrdtPrmsnDtlInq06"
 HIRA_PRICE_URL = "https://apis.data.go.kr/B551182/dgamtCrtrInfoService1.2/getDgamtList"
+# 심평원 의약품성분약효정보조회서비스: 일반명코드/약효분류번호로 분류명·일반명·함량내용·단위를 조회합니다.
+HIRA_CMPN_URL = "https://apis.data.go.kr/B551182/msupCmpnMeftInfoService/getMajorCmpnNmCdList"
 
 FIELD_BAR_CODE = "BAR_CODE"
 LIST_NUM_OF_ROWS = 500
@@ -31,8 +33,11 @@ LIST_CSV_FIELDS = [
     "ITEM_SEQ", "ITEM_NAME", "ENTP_NAME", "CANCEL_NAME", "ITEM_PERMIT_DATE",
     "MAIN_ITEM_INGR", "MAIN_INGR_ENG",
 ]  # 바코드는 상세 API에서만 확인 가능
-BASE_COLUMNS = ["허가제품명", "제약사한글명", "희귀의약품", "약가", "약효분류", "주성분영문명", "성분명", "효능효과", "용법용량"]
+BASE_COLUMNS = ["허가제품명", "제약사한글명", "희귀의약품", "약가", "약효분류", "분류명", "일반명", "함량내용", "단위", "주성분영문명", "성분명", "효능효과", "용법용량"]
 HIRA_MEFT_FIELD = "meftDivNo"
+HIRA_GNL_CODE_FIELD = "gnlNmCd"
+# getMajorCmpnNmCdList 응답 필드 → 결과 열 이름
+HIRA_CMPN_FIELDS = {"divNm": "분류명", "gnlNm": "일반명", "iqtyTxt": "함량내용", "unit": "단위"}
 
 # 식약처 상세 응답에서 실제 확인된 직접 필드와 NB_DOC_DATA 문서 섹션입니다.
 # 사용자가 체크한 항목만 API 응답/캐시에서 결과로 펼칩니다.
@@ -81,7 +86,7 @@ NEW_DRUG_PRESET_KEYS = [
     "유효기간", "성상", "전문일반구분", "보관정보", "보관_취급주의사항",
 ]
 ALWAYS_FETCH_DETAIL_KEYS = ["주성분영문명", "희귀의약품"]
-RESULT_COLUMN_ORDER = ["구분", "함량", "허가제품명", "제약사한글명", "희귀의약품", "약가", "약효분류", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
+RESULT_COLUMN_ORDER = ["구분", "함량", "허가제품명", "제약사한글명", "희귀의약품", "약가", "약효분류", "분류명", "일반명", "함량내용", "단위", "영문제품명", "주성분영문명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보", "성분명", "효능효과", "용법용량"]
 HEADING_PATTERN = re.compile(r"^\s*\d+\s*[.\-]")
 MAX_RETRY = 5
 MFDS_RAW_EXCLUDED_FIELDS = {
@@ -107,6 +112,7 @@ CACHE_CODE_FILE = DATA_DIR / "cache_약가_코드별.json"
 CACHE_NAME_FILE = DATA_DIR / "cache_약가_이름별.json"
 CACHE_DETAIL_FILE = DATA_DIR / "cache_상세정보.json"
 CACHE_MEFT_FILE = DATA_DIR / "cache_약효분류.json"
+CACHE_CMPN_FILE = DATA_DIR / "cache_성분약효.json"
 LIST_META_FILE = DATA_DIR / "허가목록_메타.json"
 KST = timezone(timedelta(hours=9))
 
@@ -468,7 +474,7 @@ def make_summary_df(result_df):
     if "용법용량" in summary_df.columns:
         summary_df["용법용량"] = summary_df["용법용량"].map(lambda value: summarize_usage(value))
     for column in summary_df.columns:
-        if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "약가", "약효분류", "주성분영문명", "영문제품명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보"}:
+        if column not in {"효능효과", "용법용량", "허가제품명", "제약사한글명", "약가", "약효분류", "분류명", "일반명", "함량내용", "단위", "주성분영문명", "영문제품명", "전문일반구분", "ATC코드", "원료약품및분량", "포장단위", "유효기간", "성상", "보관정보"}:
             summary_df[column] = summary_df[column].map(lambda value: summarize_text(value, max_chars=260, max_sentences=2))
     return summary_df
 
@@ -1000,26 +1006,81 @@ def join_hira_field(price_items, key):
 
 
 def get_effect_classification(item_name, bar_code, service_key, call_counter, cache_meft, errors):
-    """심평원 응답의 meftDivNo를 항상 조회해 약효분류로 반환합니다."""
+    """심평원 약가 응답에서 약효분류번호(meftDivNo)와 일반명코드(gnlNmCd)를 함께 반환합니다.
+
+    반환값: {"meftDivNo": "...", "gnlNmCd": "..."}
+    """
     key8 = barcode_key8(bar_code)
     cache_key = f"mdsCd:{key8}" if key8 else f"itmNm:{re.sub(r'_\(.*?\)\s*$', '', item_name or '').strip()}"
-    if cache_key in cache_meft:
-        return cache_meft[cache_key]
+    cached = cache_meft.get(cache_key)
+    # 이전 버전 캐시는 약효분류번호 문자열만 저장했으므로, 일반명코드를 얻기 위해 다시 조회합니다.
+    if isinstance(cached, dict):
+        return cached
+    empty = {HIRA_MEFT_FIELD: cached if isinstance(cached, str) else "", HIRA_GNL_CODE_FIELD: ""}
     if call_counter["hira"] >= HIRA_CALL_LIMIT:
-        return ""
+        return empty
     call_counter["hira"] += 1
     try:
         params = {"mdsCd": key8} if key8 else {"itmNm": re.sub(r"_\(.*?\)\s*$", "", item_name or "").strip()}
         items = hira_get(service_key, params)
     except (requests.RequestException, ValueError) as exc:
         errors.append(f"HIRA 약효분류 {cache_key}: {exc}")
-        return ""
+        return empty
     valid = [item for item in items if item.get("payTpNm") != "삭제"]
     if key8:
         valid = [item for item in valid if mdscd_key8(item.get("mdsCd")) == key8] or valid
-    value = clean_whitespace(valid[0].get(HIRA_MEFT_FIELD, "")) if valid else ""
+    first = valid[0] if valid else {}
+    value = {
+        HIRA_MEFT_FIELD: clean_whitespace(first.get(HIRA_MEFT_FIELD, "")),
+        HIRA_GNL_CODE_FIELD: clean_whitespace(first.get(HIRA_GNL_CODE_FIELD, "")),
+    }
     cache_meft[cache_key] = value
     return value
+
+
+def hira_cmpn_get(service_key, params):
+    query = {"serviceKey": service_key, "numOfRows": 100, "pageNo": 1}
+    query.update(params)
+    return _parse_response_items(requests.get(HIRA_CMPN_URL, params=query, timeout=30), "HIRA 성분약효")
+
+
+def get_component_info(meft_div_no, gnl_nm_cd, service_key, call_counter, cache_cmpn, errors):
+    """의약품성분약효정보조회서비스로 분류명·일반명·함량내용·단위를 조회합니다.
+
+    - 일반명코드(gnlNmCd)가 있으면 그 코드로 조회해 네 항목을 모두 채웁니다.
+    - 일반명코드가 없으면 약효분류번호(meftDivNo)로 조회해 분류명만 채웁니다.
+      (약효분류번호만으로는 같은 분류의 모든 성분이 나오므로 일반명·함량은 확정하지 않습니다.)
+    """
+    result = {column: "" for column in HIRA_CMPN_FIELDS.values()}
+    gnl_nm_cd = clean_whitespace(gnl_nm_cd)
+    meft_div_no = clean_whitespace(meft_div_no)
+    if gnl_nm_cd:
+        cache_key, params = f"gnlNmCd:{gnl_nm_cd}", {"gnlNmCd": gnl_nm_cd}
+    elif meft_div_no:
+        cache_key, params = f"meftDivNo:{meft_div_no}", {"meftDivNo": meft_div_no}
+    else:
+        return result
+    if cache_key in cache_cmpn:
+        return dict(cache_cmpn[cache_key])
+    if call_counter["hira"] >= HIRA_CALL_LIMIT:
+        return result
+    call_counter["hira"] += 1
+    try:
+        items = hira_cmpn_get(service_key, params)
+    except (requests.RequestException, ValueError, ET.ParseError) as exc:
+        errors.append(f"HIRA 성분약효 {cache_key}: {exc}")
+        return result
+    if gnl_nm_cd:
+        matched = [item for item in items if clean_whitespace(item.get(HIRA_GNL_CODE_FIELD, "")) == gnl_nm_cd] or items
+        if matched:
+            for api_key, column in HIRA_CMPN_FIELDS.items():
+                result[column] = clean_whitespace(matched[0].get(api_key, ""))
+    else:
+        matched = [item for item in items if clean_whitespace(item.get(HIRA_MEFT_FIELD, "")) == meft_div_no] or items
+        names = list(dict.fromkeys(clean_whitespace(item.get("divNm", "")) for item in matched))
+        result["분류명"] = " / ".join(name for name in names if name)
+    cache_cmpn[cache_key] = result
+    return dict(result)
 
 
 DOC_REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (drug-information app)"}
@@ -1377,7 +1438,7 @@ def render_resizable_wrapped_table(display_df, show_index=False, height=720, tab
 
     headers = [str(column) for column in table_df.columns]
     long_columns = {"효능효과", "용법용량", "성분명", "이상반응", "상호작용", "금기사항", "원료약품및분량"}
-    narrow_columns = {"약가", "제약사한글명", "약효분류"}
+    narrow_columns = {"약가", "제약사한글명", "약효분류", "단위"}
 
     def cell(value):
         if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
@@ -1499,6 +1560,7 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
     cache_name = load_json_cache(CACHE_NAME_FILE)
     cache_detail = load_json_cache(CACHE_DETAIL_FILE)
     cache_meft = load_json_cache(CACHE_MEFT_FILE)
+    cache_cmpn = load_json_cache(CACHE_CMPN_FILE)
     call_counter = {"hira": 0, "mfds": 0}
     errors = []
     columns = BASE_COLUMNS + wanted_extras
@@ -1521,8 +1583,11 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
             item_name, bar_code, hira_key, call_counter, cache_code, cache_name, errors, as_of_date
         )
         price_item = price_items[0] if price_items else None
-        effect_classification = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
-        out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "희귀의약품": detail.get("희귀의약품", ""), "약가": format_price_cell(price_items), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": join_hira_field(price_items, "mdsCd"), "약가적용시작일": join_hira_field(price_items, "adtStaDd"), "판매예정종료일": join_hira_field(price_items, "sellEptDd"), "약효분류": effect_classification, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
+        meft_info = get_effect_classification(item_name, bar_code, hira_key, call_counter, cache_meft, errors)
+        effect_classification = meft_info.get(HIRA_MEFT_FIELD, "")
+        gnl_nm_cd = meft_info.get(HIRA_GNL_CODE_FIELD, "")
+        cmpn_info = get_component_info(effect_classification, gnl_nm_cd, hira_key, call_counter, cache_cmpn, errors)
+        out_row = {"구분": group_meta.get("group_label", ""), "함량": group_meta.get("strength", ""), "허가제품명": item_name, "제약사한글명": entp_name, "희귀의약품": detail.get("희귀의약품", ""), "약가": format_price_cell(price_items), "약가기준일": as_of_date.isoformat(), "약가매칭근거": method, "심평원제품코드": join_hira_field(price_items, "mdsCd"), "약가적용시작일": join_hira_field(price_items, "adtStaDd"), "판매예정종료일": join_hira_field(price_items, "sellEptDd"), "약효분류": effect_classification, **cmpn_info, "일반명코드": gnl_nm_cd, "주성분영문명": detail.get("주성분영문명", ""), "성분명": detail.get("성분명", ""), "효능효과": detail.get("효능효과", ""), "용법용량": detail.get("용법용량", "")}
         for key in wanted_extras:
             out_row[key] = detail.get(key, "")
         if include_all_fields:
@@ -1558,6 +1623,14 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
                 "effective_start": clean_whitespace((price_item or {}).get("adtStaDd", "")),
                 "sale_end": clean_whitespace((price_item or {}).get("sellEptDd", "")),
             } if price_item else None,
+            "hira_component": {
+                "meft_div_no": effect_classification,
+                "div_nm": cmpn_info.get("분류명", ""),
+                "gnl_nm_cd": gnl_nm_cd,
+                "gnl_nm": cmpn_info.get("일반명", ""),
+                "iqty_txt": cmpn_info.get("함량내용", ""),
+                "unit": cmpn_info.get("단위", ""),
+            },
             "hira_prices": [
                 {
                     "mds_cd": clean_whitespace(item.get("mdsCd", "")),
@@ -1577,8 +1650,9 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
     save_json_cache(CACHE_NAME_FILE, cache_name)
     save_json_cache(CACHE_DETAIL_FILE, cache_detail)
     save_json_cache(CACHE_MEFT_FILE, cache_meft)
+    save_json_cache(CACHE_CMPN_FILE, cache_cmpn)
     reference_bundle = {
-        "schema_version": "1.2",
+        "schema_version": "1.3",
         "reference_date": as_of_date.isoformat(),
         "generated_at": datetime.now(KST).isoformat(timespec="seconds"),
         "product_count": len(reference_items),
