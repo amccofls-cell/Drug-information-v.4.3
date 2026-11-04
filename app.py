@@ -64,7 +64,11 @@ EXTRA_FIELD_SPECS = {
     "원료약품및분량": {"label": "원료약품 및 분량", "source": "MATERIAL_NAME", "transform": "direct"},
     "소아_고령자투여": {"label": "소아·고령자 투여", "source": "NB_DOC_DATA", "keywords": ["소아에 대한 투여", "소아투여", "고령자에 대한 투여", "고령자투여"], "transform": "section"},
     "임부_수유부투여": {"label": "임부 및 수유부 투여", "source": "NB_DOC_DATA", "keywords": ["임부 및 수유부에 대한 투여", "임부, 수유부, 가임여성 및 남성에 대한 투여", "가임여성 및 남성에 대한 투여", "임부에 대한 투여", "수유부에 대한 투여", "임부투여", "수유부투여"], "transform": "section"},
-    "금기사항": {"label": "금기사항", "source": "NB_DOC_DATA", "keywords": ["다음 환자에게는 투여하지 말 것", "투여하지 말 것", "금기"], "transform": "section"},
+    "금기사항": {"label": "금기사항", "source": "NB_DOC_DATA", "keywords": ["다음 환자에게는 투여하지 말 것", "투여하지 말 것", "금기",
+                 # 일반의약품: "다음과 같은 사람은 이 약을 복용(사용)하지 말 것"
+                 "복용하지 말 것", "사용하지 말 것", "복용하지 마십시오", "사용하지 마십시오",
+                 # "!"로 시작하면 제외 단어: "이 약을 복용하는 동안 다음의 약을 복용하지 말 것"(상호작용)이 섞이지 않게
+                 "!동안"], "transform": "section"},
     "신중투여": {"label": "신중히 투여할 환자", "source": "NB_DOC_DATA", "keywords": ["다음 환자에는 신중히 투여할 것", "신중히 투여"], "transform": "section"},
     "일반적주의": {"label": "일반적 주의", "source": "NB_DOC_DATA", "keywords": ["일반적 주의"], "transform": "section"},
     "상호작용": {"label": "상호작용", "source": "NB_DOC_DATA", "keywords": ["상호작용"], "transform": "section"},
@@ -75,7 +79,9 @@ EXTRA_FIELD_SPECS = {
     "포장단위": {"label": "포장단위", "source": "PACK_UNIT", "transform": "direct"},
     "유효기간": {"label": "유효기간", "source": "VALID_TERM", "transform": "direct"},
     "보관정보": {"label": "보관정보", "source": "STORAGE_METHOD", "transform": "direct"},
-    "보관_취급주의사항": {"label": "보관 및 취급상의 주의사항", "source": "NB_DOC_DATA", "keywords": ["보관 및 취급상의 주의사항", "보관 및 취급상의 주의", "보관취급상의주의사항"], "transform": "section"},
+    "보관_취급주의사항": {"label": "보관 및 취급상의 주의사항", "source": "NB_DOC_DATA", "keywords": ["보관 및 취급상의 주의사항", "보관 및 취급상의 주의", "보관취급상의주의사항",
+                 # 일반의약품: "저장상의 주의사항"
+                 "저장상의 주의"], "transform": "section"},
     "성상": {"label": "성상", "source": "CHART", "transform": "direct"},
     "변경내용": {"label": "변경내용", "source": "GBN_NAME", "transform": "direct"},
     "변경일자": {"label": "변경일자", "source": "CHANGE_DATE", "transform": "direct"},
@@ -379,6 +385,26 @@ def normalize_section_title(text):
     return text
 
 
+# PDF 글에서 소제목 경계만 알아보기 위한 일반의약품 소제목 표현입니다. 어느 결과 항목에도 들어가지 않습니다.
+# (소제목 번호가 1, 2, 3… 차례로 이어져야 인정하므로, 중간 소제목을 못 알아보면 그 뒤 소제목도 놓칩니다.)
+SECTION_HEADING_HINTS = [
+    "복용하기 전에", "사용하기 전에", "즉각 중지", "즉시 중지", "동안 다음의 약", "주의할 사항",
+]
+
+
+def split_keywords(keywords):
+    """찾는 말 목록을 (찾을 말, 뺄 말)로 나눕니다. "!"로 시작하는 말은 그 말이 든 소제목을 빼라는 뜻입니다."""
+    include = [normalize_section_title(k) for k in keywords if k and not k.startswith("!")]
+    exclude = [normalize_section_title(k[1:]) for k in keywords if k and k.startswith("!")]
+    return [k for k in include if k], [k for k in exclude if k]
+
+
+def heading_matches(normalized_heading, include, exclude):
+    if any(word in normalized_heading for word in exclude):
+        return False
+    return any(keyword in normalized_heading or normalized_heading in keyword for keyword in include)
+
+
 def parse_doc_sections(xml_str, keywords):
     """중첩 XML에서 title에 특정 키워드가 포함된 상위 항목과 하위 내용 추출."""
     if not xml_str or not xml_str.strip():
@@ -387,7 +413,7 @@ def parse_doc_sections(xml_str, keywords):
         root = ET.fromstring(xml_str.strip())
     except ET.ParseError:
         return ""
-    normalized_keywords = [normalize_section_title(keyword) for keyword in keywords if keyword]
+    normalized_keywords, excluded_keywords = split_keywords(keywords)
     chunks = []
     for el in root.iter():
         title = el.get("title")
@@ -401,13 +427,14 @@ def parse_doc_sections(xml_str, keywords):
         for n, idx in enumerate(heading_idx):
             heading_text = chunks[idx][1]
             normalized_heading = normalize_section_title(heading_text)
-            if any(keyword in normalized_heading or normalized_heading in keyword for keyword in normalized_keywords):
+            if heading_matches(normalized_heading, normalized_keywords, excluded_keywords):
                 end = heading_idx[n + 1] if n + 1 < len(heading_idx) else len(chunks)
                 picked.extend(text for _, text in chunks[idx:end])
     else:
         picked.extend(
             text for _, text in chunks
             if any(keyword in normalize_section_title(text) for keyword in normalized_keywords)
+            and not any(word in normalize_section_title(text) for word in excluded_keywords)
         )
     return clean_markup(" ".join(picked))
 
@@ -421,7 +448,8 @@ def parse_text_sections(text, keywords):
     lines = [line for line in str(text or "").splitlines() if line.strip()]
     if not lines:
         return ""
-    known = {normalize_section_title(k) for words in EXTRA_FIELD_KEYWORDS.values() for k in words} | {"경고"}
+    known = {normalize_section_title(k) for words in EXTRA_FIELD_KEYWORDS.values() for k in words if not k.startswith("!")} | {"경고"}
+    known |= {normalize_section_title(k) for k in SECTION_HEADING_HINTS}
     headings, last = [], 0
     for index, line in enumerate(lines):
         match = re.match(r"\s*(\d{1,2})\s*\.\s*(?=[가-힣])", line)
@@ -431,10 +459,10 @@ def parse_text_sections(text, keywords):
         if int(match.group(1)) == last + 1 and any(word in title for word in known if word):
             headings.append((index, title))
             last = int(match.group(1))
-    wanted = [normalize_section_title(k) for k in keywords if k]
+    wanted, unwanted = split_keywords(keywords)
     picked = []
     for n, (index, title) in enumerate(headings):
-        if any(word in title for word in wanted if word):
+        if any(word in title for word in wanted) and not any(word in title for word in unwanted):
             end = headings[n + 1][0] if n + 1 < len(headings) else len(lines)
             picked.append(join_wrapped_lines(lines[index:end]))
     return clean_whitespace(" ".join(picked))
