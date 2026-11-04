@@ -5,6 +5,8 @@ import os
 import re
 import time
 import html as html_lib
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -27,6 +29,10 @@ HIRA_CMPN_URL = "https://apis.data.go.kr/B551182/msupCmpnMeftInfoService/getMajo
 
 FIELD_BAR_CODE = "BAR_CODE"
 LIST_NUM_OF_ROWS = 500
+# 허가목록 페이지를 동시에 받는 개수. 너무 크게 하면 공공데이터포털에서 오류(과다 요청)가 날 수 있습니다.
+LIST_FETCH_WORKERS = 4
+# 수집 중 임시 파일에 진행 상황을 저장하는 간격(페이지 수)
+LIST_TEMP_SAVE_EVERY = 20
 HIRA_CALL_LIMIT = 600
 MFDS_CALL_LIMIT = 1000
 LIST_CSV_FIELDS = [
@@ -1276,6 +1282,36 @@ def fetch_list_page(page, mfds_key):
     raise last_err
 
 
+def load_list_resume(temp_file, cache_day):
+    """허가목록 임시 파일을 {페이지번호: 항목목록}, 총건수로 읽습니다. 날짜가 다르거나 읽을 수 없으면 버립니다."""
+    if not temp_file.exists():
+        return {}, None
+    try:
+        with temp_file.open("r", encoding="utf-8") as file:
+            resume = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {}, None
+    if "pages" in resume:
+        if resume.get("cache_day") != cache_day:
+            return {}, None
+        return {int(page): items for page, items in resume["pages"].items()}, resume.get("total_count")
+    # 이전 버전 형식: 1페이지부터 next_page-1페이지까지 차례로 이어 붙인 rows
+    rows, next_page = resume.get("rows", []), int(resume.get("next_page", 1))
+    pages = {
+        page: rows[(page - 1) * LIST_NUM_OF_ROWS: page * LIST_NUM_OF_ROWS]
+        for page in range(1, next_page)
+    }
+    return {page: items for page, items in pages.items() if items}, resume.get("total_count")
+
+
+def save_list_resume(temp_file, cache_day, pages, total_count):
+    with temp_file.open("w", encoding="utf-8") as file:
+        json.dump(
+            {"cache_day": cache_day, "total_count": total_count, "pages": {str(page): items for page, items in pages.items()}},
+            file, ensure_ascii=False,
+        )
+
+
 # cache_data → cache_resource: cache_data는 호출할 때마다 수만 건 목록을 복사(역직렬화)하지만,
 # cache_resource는 같은 객체를 그대로 돌려주므로 매 재실행마다 드는 비용이 거의 없습니다.
 # (반환된 목록은 읽기 전용으로만 사용하세요.)
@@ -1304,31 +1340,51 @@ def load_permitted_drugs(mfds_key, data_dir_string, cache_day, force_refresh_tok
     if not mfds_key:
         raise ValueError("오늘 날짜의 허가목록 캐시가 없습니다. 식약처 인증키를 입력해야 허가목록을 갱신할 수 있습니다.")
 
-    if temp_file.exists():
-        with temp_file.open("r", encoding="utf-8") as file:
-            resume = json.load(file)
-        all_rows, page, total_count = resume["rows"], resume["next_page"], resume.get("total_count")
-    else:
-        all_rows, page, total_count = [], 1, None
+    # 이어받기: 같은 날 수집하다 멈춘 임시 파일이 있으면 받은 페이지는 건너뜁니다.
+    pages, total_count = load_list_resume(temp_file, cache_day)
 
     progress = st.progress(0, text="식약처 허가목록을 수집하는 중입니다…")
-    while True:
-        body, items = fetch_list_page(page, mfds_key)
-        if total_count is None:
-            total_count = int(body.get("totalCount", 0))
-        if not items:
-            break
-        all_rows.extend(items)
-        page += 1
+    if 1 not in pages or total_count is None:
+        body, items = fetch_list_page(1, mfds_key)
+        total_count = int(body.get("totalCount", 0) or 0)
+        pages[1] = items
+    total_pages = max(1, math.ceil(total_count / LIST_NUM_OF_ROWS)) if total_count else 1
+    remaining = [page for page in range(2, total_pages + 1) if page not in pages]
+
+    def report():
+        done = sum(len(items) for items in pages.values())
         if total_count:
-            progress.progress(min(len(all_rows) / total_count, 1.0), text=f"허가목록 수집 중: {len(all_rows):,}/{total_count:,}")
-        if page % 10 == 0 or (total_count and len(all_rows) >= total_count):
-            with temp_file.open("w", encoding="utf-8") as file:
-                json.dump({"rows": all_rows, "next_page": page, "total_count": total_count}, file, ensure_ascii=False)
-        if total_count and len(all_rows) >= total_count:
-            break
-        time.sleep(0.1)
+            progress.progress(
+                min(done / total_count, 1.0),
+                text=f"허가목록 수집 중: {done:,}/{total_count:,} (동시 {LIST_FETCH_WORKERS}페이지)",
+            )
+
+    report()
+    failures = []
+    # 페이지를 여러 개 동시에 받습니다. Streamlit 화면 갱신과 파일 저장은 이 루프(메인 스레드)에서만 합니다.
+    with ThreadPoolExecutor(max_workers=LIST_FETCH_WORKERS) as pool:
+        futures = {pool.submit(fetch_list_page, page, mfds_key): page for page in remaining}
+        for count, future in enumerate(as_completed(futures), start=1):
+            page = futures[future]
+            try:
+                _, items = future.result()
+            except (requests.RequestException, ValueError) as exc:
+                failures.append((page, exc))
+                continue
+            pages[page] = items
+            report()
+            if count % LIST_TEMP_SAVE_EVERY == 0:
+                save_list_resume(temp_file, cache_day, pages, total_count)
+    if failures:
+        save_list_resume(temp_file, cache_day, pages, total_count)
+        progress.empty()
+        failed = ", ".join(str(page) for page, _ in sorted(failures, key=lambda pair: pair[0])[:10])
+        raise RuntimeError(
+            f"허가목록 {len(failures)}개 페이지를 받지 못했습니다(페이지 {failed}…). "
+            f"받은 페이지는 저장했으니 다시 실행하면 나머지만 이어서 받습니다. 마지막 오류: {failures[-1][1]}"
+        )
     progress.empty()
+    all_rows = [row for page in sorted(pages) for row in pages[page]]
 
     with list_file.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=LIST_CSV_FIELDS, extrasaction="ignore")
