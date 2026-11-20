@@ -4,6 +4,8 @@ import json
 import os
 import re
 import time
+import traceback
+from urllib.parse import quote, quote_plus
 import html as html_lib
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -141,6 +143,22 @@ LIST_META_FILE = DATA_DIR / "허가목록_메타.json"
 # 저장소의 이 폴더에 넣어 두면, 파일 이름이 가장 뒤인(날짜가 가장 최근인) 파일을 씁니다.
 NONPAY_LIST_DIR = Path(__file__).resolve().parent / "data" / "비급여목록"
 KST = timezone(timedelta(hours=9))
+
+
+# 요청 주소에 들어간 인증키(serviceKey=…)가 오류 문구에 그대로 찍히므로, 화면·JSON에 내보내기 전에 가립니다.
+SERVICE_KEY_PATTERN = re.compile(r"(service_?key=)[^&\s'\"<>]+", re.IGNORECASE)
+
+
+def mask_secrets(text, *secrets):
+    """오류 문구에서 serviceKey 값과, 넘겨받은 인증키(원문·URL 인코딩 형태)를 '***'로 바꿉니다."""
+    masked = SERVICE_KEY_PATTERN.sub(r"\1***", str(text))
+    for secret in secrets:
+        secret = str(secret or "")
+        if len(secret) < 8:
+            continue
+        for form in {secret, quote(secret, safe=""), quote_plus(secret, safe="")}:
+            masked = masked.replace(form, "***")
+    return masked
 
 
 def clean_whitespace(text):
@@ -2163,13 +2181,14 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
     save_json_cache(CACHE_MEFT_FILE, cache_meft)
     save_json_cache(CACHE_CMPN_FILE, cache_cmpn)
     save_json_cache(CACHE_PILL_FILE, cache_pill)
+    errors[:] = [mask_secrets(error, mfds_key, hira_key) for error in errors]
     reference_bundle = {
         "schema_version": "1.5",
         "reference_date": as_of_date.isoformat(),
         "generated_at": datetime.now(KST).isoformat(timespec="seconds"),
         "product_count": len(reference_items),
         "products": reference_items,
-        "api_warnings": errors,
+        "api_warnings": errors,  # 아래에서 인증키를 가린 뒤의 목록입니다(같은 목록 객체).
     }
     return order_result_columns(pd.DataFrame(output)), errors, reference_bundle
 
@@ -2582,8 +2601,9 @@ if not hira_key:
 try:
     all_rows = load_permitted_drugs(mfds_key, str(DATA_DIR), cache_day)
 except Exception as exc:
-    st.error(f"허가목록 수집에 실패했습니다: {exc}")
-    st.exception(exc)
+    st.error(mask_secrets(f"허가목록 수집에 실패했습니다: {exc}", mfds_key, hira_key))
+    # st.exception은 오류 문구를 그대로 보여 주므로, 인증키를 가린 traceback을 대신 보여 줍니다.
+    st.code(mask_secrets(traceback.format_exc(), mfds_key, hira_key), language="text")
     st.stop()
 
 normal_rows = [row for row in all_rows if row.get("CANCEL_NAME") == "정상"]
@@ -2861,9 +2881,9 @@ if st.session_state.last_result is not None:
         csv_suffix = "_행열전환" if transpose_view else ""
         st.download_button("결과 CSV 다운로드", data=csv_bytes, file_name=f"의약품조회결과_{timestamp}{csv_suffix}.csv", mime="text/csv")
         if st.session_state.last_reference_json is not None:
-            reference_json_bytes = json.dumps(
+            reference_json_bytes = mask_secrets(json.dumps(
                 st.session_state.last_reference_json, ensure_ascii=False, indent=2
-            ).encode("utf-8")
+            ), mfds_key, hira_key).encode("utf-8")
             reference_date = st.session_state.last_reference_json.get("reference_date", "")
             st.download_button(
                 "AI 검토용 JSON 다운로드",
@@ -2900,4 +2920,4 @@ if st.session_state.last_result is not None:
     if st.session_state.last_errors:
         with st.expander(f"API 경고/오류 {len(st.session_state.last_errors)}건"):
             for error in st.session_state.last_errors:
-                st.warning(error)
+                st.warning(mask_secrets(error, mfds_key, hira_key))
