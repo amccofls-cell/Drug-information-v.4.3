@@ -1055,12 +1055,24 @@ def price_line_label(item, all_items):
     return f"{code} ({hint})" if hint else code
 
 
+def price_spec_hint(item):
+    """약가 한 건의 포장·규격: 심평원 포장·규격 필드 + 제품명 끝 '_(10g)' 같은 규격. 없으면 빈 값."""
+    hint = hira_package_hint(item)
+    suffix = re.search(r"_\((.*?)\)\s*$", clean_whitespace((item or {}).get("itmNm", "")))
+    if suffix and suffix.group(1) and suffix.group(1) not in hint:
+        hint = f"{hint} {suffix.group(1)}".strip()
+    return hint
+
+
 def format_price_cell(price_items):
-    """약가 1건이면 기존과 같은 '1,309원', 여러 건이면 포장(제품코드)별로 줄을 나눠 모두 표시합니다."""
+    """약가 1건이면 '1,309원 (10g/튜브)'처럼 포장·규격을 괄호로 붙이고(없으면 가격만),
+    여러 건이면 포장(제품코드)별로 줄을 나눠 '제품코드 (포장·규격): 가격'으로 모두 표시합니다."""
     if not price_items:
         return ""
     if len(price_items) == 1:
-        return format_price(price_items[0].get("mxCprc", ""))
+        price = format_price(price_items[0].get("mxCprc", ""))
+        hint = price_spec_hint(price_items[0])
+        return f"{price} ({hint})" if price and hint else price
     return "\n".join(
         f"{price_line_label(item, price_items)}: {format_price(item.get('mxCprc', ''))}"
         for item in price_items
@@ -2534,7 +2546,7 @@ def section_header(step, title):
         unsafe_allow_html=True,
     )
 
-APP_VERSION = "2026-10-26c · 식약처 PDF 문서 대응"  # 올린 파일이 실제로 반영됐는지 사이드바에서 확인합니다
+APP_VERSION = "2026-11-24 · v4.8.3 약가 포장·규격 표시"  # 올린 파일이 실제로 반영됐는지 사이드바에서 확인합니다
 
 with st.sidebar:
     st.header("환경 설정")
