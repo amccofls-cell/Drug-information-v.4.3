@@ -161,6 +161,11 @@ def mask_secrets(text, *secrets):
     return masked
 
 
+def perf_log(message):
+    """속도 점검용 로그. Streamlit Cloud의 Manage app → 로그에 '[성능]'으로 찍힙니다."""
+    print(f"[성능] {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} {message}", flush=True)
+
+
 def clean_whitespace(text):
     if text is None:
         return ""
@@ -1747,15 +1752,19 @@ def load_permitted_drugs(mfds_key, data_dir_string, cache_day, force_refresh_tok
         except (OSError, json.JSONDecodeError):
             cache_is_fresh = False
 
+    started = time.perf_counter()
     if cache_is_fresh:
         with list_file.open("r", encoding="utf-8-sig", newline="") as file:
-            return list(csv.DictReader(file))
+            rows_from_file = list(csv.DictReader(file))
+        perf_log(f"허가목록: 오늘 저장된 파일에서 읽음 {len(rows_from_file):,}건, {time.perf_counter() - started:.1f}초")
+        return rows_from_file
 
     if not mfds_key:
         raise ValueError("오늘 날짜의 허가목록 캐시가 없습니다. 식약처 인증키를 입력해야 허가목록을 갱신할 수 있습니다.")
 
     # 이어받기: 같은 날 수집하다 멈춘 임시 파일이 있으면 받은 페이지는 건너뜁니다.
     pages, total_count = load_list_resume(temp_file, cache_day)
+    resumed_pages = len(pages)
 
     progress = st.progress(0, text="식약처 허가목록을 수집하는 중입니다…")
     if 1 not in pages or total_count is None:
@@ -1790,6 +1799,7 @@ def load_permitted_drugs(mfds_key, data_dir_string, cache_day, force_refresh_tok
             if count % LIST_TEMP_SAVE_EVERY == 0:
                 save_list_resume(temp_file, cache_day, pages, total_count)
     if failures:
+        perf_log(f"허가목록: 수집 실패 페이지 {len(failures)}개, {time.perf_counter() - started:.1f}초")
         save_list_resume(temp_file, cache_day, pages, total_count)
         progress.empty()
         failed = ", ".join(str(page) for page, _ in sorted(failures, key=lambda pair: pair[0])[:10])
@@ -1799,6 +1809,10 @@ def load_permitted_drugs(mfds_key, data_dir_string, cache_day, force_refresh_tok
         )
     progress.empty()
     all_rows = [row for page in sorted(pages) for row in pages[page]]
+    perf_log(
+        f"허가목록: 식약처에서 수집 {len(all_rows):,}건, {len(pages)}페이지"
+        f"(이어받은 페이지 {resumed_pages}), {time.perf_counter() - started:.1f}초"
+    )
 
     with list_file.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=LIST_CSV_FIELDS, extrasaction="ignore")
@@ -2081,7 +2095,11 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
     output = []
     reference_items = []
     progress = st.progress(0, text="조회 중입니다…")
+    lookup_started = time.perf_counter()
+    perf_log(f"조회 시작: {len(rows)}개 품목")
     for index, row in enumerate(rows, start=1):
+        item_started = time.perf_counter()
+        calls_before = dict(call_counter)
         item_seq = row.get("ITEM_SEQ", "")
         item_name = clean_whitespace(row.get("ITEM_NAME", ""))
         entp_name = clean_whitespace(row.get("ENTP_NAME", ""))
@@ -2185,7 +2203,13 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
             ],
         })
         progress.progress(index / len(rows), text=f"조회 중: {index}/{len(rows)}")
+        perf_log(
+            f"조회 {index}/{len(rows)} {item_name} (품목코드 {item_seq}): {time.perf_counter() - item_started:.1f}초, "
+            f"심평원 호출 {call_counter['hira'] - calls_before.get('hira', 0)}회, "
+            f"식약처 호출 {call_counter['mfds'] - calls_before.get('mfds', 0)}회"
+        )
     progress.empty()
+    saving_started = time.perf_counter()
     save_json_cache(CACHE_CODE_FILE, cache_code)
     save_json_cache(CACHE_NAME_FILE, cache_name)
     save_json_cache(CACHE_DETAIL_FILE, cache_detail)
@@ -2193,6 +2217,11 @@ def lookup_selected(rows, mfds_key, hira_key, wanted_extras, as_of_date, group_l
     save_json_cache(CACHE_MEFT_FILE, cache_meft)
     save_json_cache(CACHE_CMPN_FILE, cache_cmpn)
     save_json_cache(CACHE_PILL_FILE, cache_pill)
+    perf_log(
+        f"조회 끝: {len(rows)}개 품목, 전체 {time.perf_counter() - lookup_started:.1f}초"
+        f"(캐시 저장 {time.perf_counter() - saving_started:.1f}초), "
+        f"심평원 호출 {call_counter['hira']}회, 식약처 호출 {call_counter['mfds']}회, API 경고 {len(errors)}건"
+    )
     errors[:] = [mask_secrets(error, mfds_key, hira_key) for error in errors]
     reference_bundle = {
         "schema_version": "1.5",
@@ -2255,6 +2284,7 @@ def check_dur(rows, mfds_key, dur_indices, cache_detail, call_counter, errors):
     return pd.DataFrame(result_rows, columns=columns)
 
 
+RERUN_STARTED = time.perf_counter()  # 화면 다시 그리기 시간 측정 시작(스크립트는 매번 처음부터 다시 실행됩니다)
 st.set_page_config(
     page_title="의약품 통합 조회",
     page_icon="💊",
@@ -2546,7 +2576,7 @@ def section_header(step, title):
         unsafe_allow_html=True,
     )
 
-APP_VERSION = "2026-11-24 · v4.8.3 약가 포장·규격 표시"  # 올린 파일이 실제로 반영됐는지 사이드바에서 확인합니다
+APP_VERSION = "2026-11-27 · v4.8.4 속도 점검 로그"  # 올린 파일이 실제로 반영됐는지 사이드바에서 확인합니다
 
 with st.sidebar:
     st.header("환경 설정")
@@ -2933,3 +2963,7 @@ if st.session_state.last_result is not None:
         with st.expander(f"API 경고/오류 {len(st.session_state.last_errors)}건"):
             for error in st.session_state.last_errors:
                 st.warning(mask_secrets(error, mfds_key, hira_key))
+
+# 화면을 끝까지 다시 그린 시간. (조회 버튼을 누른 회차에는 조회 시간이 포함됩니다.)
+_shown = len(st.session_state.last_result) if st.session_state.get("last_result") is not None else 0
+perf_log(f"화면 갱신: {time.perf_counter() - RERUN_STARTED:.2f}초 (결과 {_shown}개 표시 중)")
